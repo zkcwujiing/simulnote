@@ -49,9 +49,30 @@ function ortWasmPolicy(): Plugin {
   };
 }
 
+/**
+ * 把分享预览图改成**绝对地址**。
+ *
+ * 微信、QQ、Telegram 抓取 `og:image` 时基本不做相对路径解析，写
+ * `content="og-image.png"` 的结果通常是没有预览图。所以部署时用
+ * `VITE_SITE_URL` 告诉构建「站点的公开根地址是什么」，这里把 meta 补全。
+ *
+ * 没设这个变量时**行为完全不变**（保持相对路径），本地开发不受影响。
+ */
+function socialMeta(): Plugin {
+  const raw = (process.env.VITE_SITE_URL || '').trim();
+  const siteUrl = raw ? raw.replace(/\/+$/, '') + '/' : '';
+  return {
+    name: 'simulnote:social-meta',
+    transformIndexHtml(html) {
+      if (!siteUrl) return html;
+      return html.replaceAll('content="og-image.png"', `content="${siteUrl}og-image.png"`);
+    },
+  };
+}
+
 export default defineConfig({
   base,
-  plugins: [react(), tailwindcss(), ortWasmPolicy()],
+  plugins: [react(), tailwindcss(), ortWasmPolicy(), socialMeta()],
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url)),

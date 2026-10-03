@@ -39,8 +39,15 @@ jobs:
       - name: Build
         # 项目站点部署在 /<仓库名>/ 子路径下，base 必须跟着走，否则所有
         # 静态资源都会 404（这是 GitHub Pages 项目站最常见的坑）。
+        #
+        # 例外：如果仓库名恰好是 `<用户名>.github.io`（用户站），它部署在根路径，
+        # 此时要把 VITE_BASE 改成 `/`，VITE_SITE_URL 改成 `https://<用户名>.github.io/`。
+        #
+        # VITE_SITE_URL 只用于把 og:image 补成绝对地址（微信/TG 的预览卡片需要），
+        # 写错只影响分享缩略图，不影响功能。
         env:
           VITE_BASE: /${{ github.event.repository.name }}/
+          VITE_SITE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
         run: pnpm build
 
       - name: Zero-cost guard
