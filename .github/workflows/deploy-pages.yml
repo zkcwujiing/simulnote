@@ -26,7 +26,9 @@ jobs:
 
       - uses: pnpm/action-setup@v4
         with:
-          version: 11
+          # 必须和生成 pnpm-lock.yaml 的版本对齐（本地是 12.3.4），
+          # 否则 --frozen-lockfile 可能因锁文件格式差异直接失败。
+          version: 12
 
       - uses: actions/setup-node@v4
         with:
@@ -82,6 +84,10 @@ jobs:
         run: pnpm build
 
       - uses: actions/configure-pages@v5
+        with:
+          # 首次运行时仓库里还没开启 Pages，这一步会顺手把它打开（Source=GitHub Actions），
+          # 省掉一次必须手点 Settings→Pages 的操作。已经开过就是空操作。
+          enablement: true
 
       - uses: actions/upload-pages-artifact@v3
         with:

@@ -2,21 +2,28 @@ name: Deploy to Cloudflare Pages
 
 # 免费额度（docs/08）：20,000 个文件、**单文件 ≤25 MiB**、500 次构建/月、带宽不计量。
 #
-# ⚠️ 单文件 25 MiB 是这条路线唯一的硬伤：transformers.js 会顺带产出
-# `ort-wasm-simd-threaded.asyncify.wasm`，**26,861,777 字节**，超限会被拒。
-# 两种解法，任选其一：
+# ⚠️ 单文件 25 MiB 是这条路线唯一的硬伤，而现在超限的是 **4 个文件**：
 #
-#   A（推荐，保持单源站）：什么都不用做，本 workflow 会把超过 25MiB 的文件
-#     当作**错误**报出来（见下面的 size-gate），而不是让 Cloudflare 抛一句
-#     看不懂的话。此时改用 GitHub Pages 那一个链接即可，功能完全一样。
+#   1 个 wasm：`ort-wasm-simd-threaded.asyncify.wasm`（26,861,777 字节）
+#   3 个模型：自托管之后，`models/` 下的 .onnx 一片就是 29–57 MiB
 #
-#   B（两个源站都完整）：把那个 wasm 上传成**本仓库的 GitHub Release 资产**，
+# 这两类的性质完全不同（见 docs/07 的 R13 和 R15）：
+#
+#   · **wasm 能外置**：把那个 wasm 上传成**本仓库的 GitHub Release 资产**，
 #     然后在仓库 Settings → Secrets and variables → Actions → Variables 里加一个
 #     变量 `VITE_ORT_WASM_BASE`，值形如
 #       https://github.com/<你>/<仓库>/releases/download/wasm-v1/
 #     本 workflow 会把它透传给构建；vite.config.ts 的 ortWasmPolicy 插件
 #     据此把超大 wasm 从产物里剔除，运行时再由 lib/ortEnv.ts 交给 ORT。
 #     （Release 资产同样是免费的，无需任何付费账号。）
+#
+#   · **模型不能外置**：外置就等于回到「运行时从第三方 CDN 取权重」，
+#     而那正是这次改造要消灭的东西（huggingface.co 实测 0/3 不通）。
+#     减小模型清单也没用 —— q8 量化下每一片都超过 25 MiB。
+#
+# 所以结论是：**GitHub Pages 是唯一无损路线**，这条 workflow 在模型自托管之后
+# 实际上走不通了，除非愿意把模型放回第三方 CDN。留着它是为了将来
+# 「只发一个纯转写/不带动模型的版本」时还能用。
 
 # ⚠️ 这条工作流**故意只手动触发**，不在 push 时自动跑。
 # 原因：它需要 2 个仓库 secret（CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID）
@@ -38,7 +45,8 @@ jobs:
 
       - uses: pnpm/action-setup@v4
         with:
-          version: 11
+          # 和生成 pnpm-lock.yaml 的版本对齐（见 deploy-pages.yml 的说明）。
+          version: 12
 
       - uses: actions/setup-node@v4
         with:
