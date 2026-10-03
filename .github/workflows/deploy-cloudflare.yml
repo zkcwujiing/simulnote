@@ -1,0 +1,66 @@
+name: Deploy to Cloudflare Pages
+
+# 免费额度（docs/08）：20,000 个文件、**单文件 ≤25 MiB**、500 次构建/月、带宽不计量。
+#
+# ⚠️ 单文件 25 MiB 是这条路线唯一的硬伤：transformers.js 会顺带产出
+# `ort-wasm-simd-threaded.asyncify.wasm`，**26,861,777 字节**，超限会被拒。
+# 两种解法，任选其一：
+#
+#   A（推荐，保持单源站）：什么都不用做，本 workflow 会把超过 25MiB 的文件
+#     当作**错误**报出来（见下面的 size-gate），而不是让 Cloudflare 抛一句
+#     看不懂的话。此时改用 GitHub Pages 那一个链接即可，功能完全一样。
+#
+#   B（两个源站都完整）：把那个 wasm 上传成**本仓库的 GitHub Release 资产**，
+#     然后在仓库 Settings → Secrets and variables → Actions → Variables 里加一个
+#     变量 `VITE_ORT_WASM_BASE`，值形如
+#       https://github.com/<你>/<仓库>/releases/download/wasm-v1/
+#     本 workflow 会把它透传给构建；vite.config.ts 的 ortWasmPolicy 插件
+#     据此把超大 wasm 从产物里剔除，运行时再由 lib/ortEnv.ts 交给 ORT。
+#     （Release 资产同样是免费的，无需任何付费账号。）
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: cloudflare-pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        # base 用默认的 '/'：Cloudflare Pages 部署在根路径。
+        env:
+          VITE_BASE: /
+          VITE_ORT_WASM_BASE: ${{ vars.VITE_ORT_WASM_BASE }}
+        run: pnpm build
+
+      - name: Zero-cost guard
+        run: pnpm lint:cost
+
+      - name: Size gate (Cloudflare Pages 单文件上限 25 MiB)
+        run: node scripts/check-upload-size.mjs
+
+      - name: Publish
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy dist --project-name=simulnote --branch=main

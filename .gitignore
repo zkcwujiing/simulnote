@@ -1,0 +1,19 @@
+node_modules
+dist
+dist-ssr
+dev-dist
+
+# 包管理器缓存（pnpm 的 store-dir 指到了项目内，体积很大，绝不入库）
+.pnpm-store
+
+# 构建中间产物
+.vite
+.tmp
+*.tsbuildinfo
+
+# 本地环境与编辑器
+*.local
+.DS_Store
+.env
+.env.*
+!.env.example

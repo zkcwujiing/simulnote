@@ -1,0 +1,9 @@
+# 统一换行符。CI 跑在 Ubuntu 上，本地开发在 Windows 上，
+# 如果不固定，git 会在每次检出时把 LF 换成 CRLF，产生大量无意义的 diff。
+* text=auto eol=lf
+
+# 二进制文件不要做任何行尾处理
+*.png binary
+*.wasm binary
+*.ico binary
+*.jpg binary

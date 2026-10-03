@@ -1,0 +1,30 @@
+# pnpm 11 把「哪些依赖允许执行构建脚本」放在这里（设置名是 `allowBuilds`）。
+#
+# 注意：本文件**没有** `packages` 字段 —— 本项目是单包工程，不拆 workspace
+# （见 docs/05 的决策），这个文件只承载设置。
+#
+# 放行策略（全部设为 false，理由如下）：
+#   - esbuild: 它的 postinstall 只是「校验 / 补下载」平台二进制，而 pnpm 已经通过
+#     optionalDependencies 把 `@esbuild/win32-x64` 装好了，二进制直接可用。
+#     在受限沙箱下这个 postinstall 会 spawn EPERM（子进程管道被禁），
+#     放行反而让整个 install 失败，所以关掉。
+#   - onnxruntime-node: transformers.js 的 Node 后端，浏览器端完全用不到；
+#   - protobufjs: postinstall 只生成类型，浏览器端不需要。
+allowBuilds:
+  esbuild: false
+  onnxruntime-node: false
+  protobufjs: false
+
+# nodeLinker=hoisted：把依赖平铺进 node_modules，而不是 pnpm 默认的
+# 「软链接 + 虚拟 store」布局。
+#
+# 为什么必须这样：Windows 上 pnpm 用 **junction**（目录联接）实现链接，而 Node 的
+# ESM 解析器使用 JS 版 realpath —— 它不解析 junction。结果
+# `node_modules/vite/dist/node/chunks/config.js` 里的 `import 'rollup'` 会从
+# `node_modules/` 起向上查找，那里没有 rollup，构建直接报
+#   Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'rollup'
+# 平铺布局下所有依赖都是真实目录，向上查找必定命中。
+#
+# 代价：node_modules 更大、不再是严格依赖树。本项目是单包工程、没有 workspace，
+# 不依赖 pnpm 的严格性，可以接受。
+nodeLinker: hoisted

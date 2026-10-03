@@ -1,0 +1,152 @@
+@import 'tailwindcss';
+
+/*
+ * 设计基调：深色 + 高对比。
+ * 理由：同传场景常常是「手机立在桌上、一边听一边看」，深色在室内更不刺眼，
+ * 也更省电（OLED）。中文正文用系统字体栈，避免任何额外字体下载 —— 这个项目
+ * 的所有字节都应该花在模型上，而不是装饰上。
+ */
+@theme {
+  --color-ink-950: #070b14;
+  --color-ink-900: #0b1220;
+  --color-ink-850: #101a2c;
+  --color-ink-800: #16223a;
+  --color-ink-700: #1e2d4a;
+  --color-ink-500: #3b4f75;
+  --color-brand-400: #38e0c8;
+  --color-brand-500: #22c9b4;
+  --color-brand-600: #14a795;
+  --color-warn-400: #fbbf24;
+  --color-warn-600: #d97706;
+  --color-danger-400: #f87171;
+  --color-danger-600: #dc2626;
+
+  --font-sans:
+    system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', 'Noto Sans SC', sans-serif;
+  --font-mono: ui-monospace, 'SFMono-Regular', 'Cascadia Mono', Consolas, monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-ink-950);
+  color: #e6ecf7;
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  /* 移动端下拉时不要连带整个页面弹跳 */
+  overscroll-behavior-y: none;
+}
+
+/* 安全区：iPhone 的刘海与 Home 指示条 */
+@utility pb-safe {
+  padding-bottom: max(1rem, env(safe-area-inset-bottom));
+}
+
+@utility pt-safe {
+  padding-top: max(0.75rem, env(safe-area-inset-top));
+}
+
+/*
+ * 组件层刻意写成**纯 CSS**，不用 `@apply btn` 这种「用一个组件类套另一个组件类」的写法：
+ * Tailwind v4 的 @apply 只认工具类，套组件类会在构建时直接失败
+ * （Cannot apply unknown utility class `btn`）。
+ */
+@layer components {
+  .card {
+    border-radius: var(--radius-2xl, 1rem);
+    border: 1px solid color-mix(in oklab, var(--color-ink-700) 70%, transparent);
+    background-color: color-mix(in oklab, var(--color-ink-900) 80%, transparent);
+    padding: 1rem;
+  }
+
+  .btn,
+  .btn-primary,
+  .btn-ghost,
+  .btn-danger {
+    display: inline-flex;
+    min-height: 2.75rem;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    border-radius: 0.75rem;
+    padding-inline: 1rem;
+    font-size: 0.875rem;
+    font-weight: 500;
+    line-height: 1.25rem;
+    user-select: none;
+    transition:
+      background-color 150ms ease,
+      border-color 150ms ease,
+      color 150ms ease;
+  }
+
+  .btn:disabled,
+  .btn-primary:disabled,
+  .btn-ghost:disabled,
+  .btn-danger:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+  }
+
+  .btn-primary {
+    background-color: var(--color-brand-500);
+    color: var(--color-ink-950);
+  }
+  .btn-primary:hover:not(:disabled) {
+    background-color: var(--color-brand-400);
+  }
+  .btn-primary:active:not(:disabled) {
+    background-color: var(--color-brand-600);
+  }
+
+  .btn-ghost {
+    border: 1px solid var(--color-ink-700);
+    color: #e2e8f0;
+  }
+  .btn-ghost:hover:not(:disabled) {
+    background-color: var(--color-ink-800);
+  }
+  .btn-ghost:active:not(:disabled) {
+    background-color: var(--color-ink-700);
+  }
+
+  .btn-danger {
+    background-color: var(--color-danger-600);
+    color: #ffffff;
+  }
+  .btn-danger:hover:not(:disabled) {
+    background-color: var(--color-danger-400);
+  }
+
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    border-radius: 9999px;
+    border: 1px solid var(--color-ink-700);
+    padding: 0.125rem 0.5rem;
+    font-size: 11px;
+    line-height: 1.25rem;
+  }
+
+  .scroll-area {
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-ink-500) transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

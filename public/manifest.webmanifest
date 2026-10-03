@@ -1,0 +1,27 @@
+{
+  "name": "SimulNote 同传笔记",
+  "short_name": "同传笔记",
+  "description": "英文讲话实时中译 + 自动中文要点纪要。全部在浏览器本地计算，免费、免安装。",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0f172a",
+  "theme_color": "#0f172a",
+  "lang": "zh-CN",
+  "categories": ["productivity", "utilities"],
+  "icons": [
+    {
+      "src": "favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ]
+}
