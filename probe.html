@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#0f172a" />
+    <meta name="color-scheme" content="dark light" />
+
+    <title>SimulNote · M0 可行性探针</title>
+    <meta
+      name="description"
+      content="开发用诊断页：在当前设备上实测 WebGPU、内存上限、存储配额、本地模型速度与摘要质量。"
+    />
+    <!-- 诊断页不该被搜索引擎收录，也不该出现在分享预览里 -->
+    <meta name="robots" content="noindex, nofollow" />
+
+    <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="同传探针" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/probe/main.tsx"></script>
+  </body>
+</html>

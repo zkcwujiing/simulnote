@@ -21,7 +21,9 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SCAN_DIRS = ['src', 'public'];
-const SCAN_FILES = ['index.html'];
+// 每个 HTML 入口都要扫：主应用 index.html 与 M0 探针 probe.html。
+// 新增页面时别忘了加进来，否则护栏会留一个盲区。
+const SCAN_FILES = ['index.html', 'probe.html'];
 const SKIP_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp', '.ico', '.woff', '.woff2', '.onnx', '.wasm', '.mp3']);
 
 /** 允许出现的外部主机：模型权重 CDN，以及本项目自己的静态资产托管。 */

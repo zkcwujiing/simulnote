@@ -55,10 +55,16 @@
 
 ```bash
 pnpm install
-pnpm dev          # 打开 http://localhost:5173
+pnpm dev          # 主应用：http://localhost:5173
+                  # M0 探针：http://localhost:5173/probe.html
 ```
 
 麦克风需要「安全上下文」：`localhost` 可以，`file://` 打开**不行**。
+
+**M0 可行性探针**（`probe.html`）是给开发/验证用的诊断页：在**当前这台设备**上实测 WebGPU 能力、
+内存上限、存储配额、本地 Whisper / 翻译模型的速度（RTF）与摘要质量，最后生成一份可复制的
+Markdown 报告。它不碰主应用状态，也不会把数据发出去。手机验证的做法是：部署后在同一条链接后面
+加 `/probe.html`，用手机打开、跑完、把报告发回来。
 
 ```bash
 pnpm build        # 类型检查 + 生产构建，产物在 dist/
@@ -86,12 +92,13 @@ pnpm verify       # 上面三件事一起跑
 | 决策 | `src/engines/registry.ts`：三档模式（自动 / 完全本地 / 最快启动），探测顺序即优先级，**任何一环都允许降级，绝不白屏** |
 | 界面 | 环境探测面板、实时双语滚动（虚拟列表）、纪要视图、Markdown/纯文本导出、分享二维码 |
 | 护栏 | `scripts/check-zero-cost.mjs`（零成本）、`scripts/check-upload-size.mjs`（部署体积） |
+| 验证 | `probe.html` + `src/probe/`：M0 探针页，**已就绪、待真机运行** |
 
-构建实测：`pnpm build` 通过（`tsc -b` 无错误，vite 产物约 0.98 MB JS/CSS + 26.8 MB 的 ONNX Runtime wasm）。
+构建实测：`pnpm build` 通过（`tsc -b` 无错误，两个入口 `index.html` + `probe.html`，约 0.98 MB JS/CSS + 26.8 MB 的 ONNX Runtime wasm）。
 
 ### 还没做的（也是接下来最该做的）
 
-1. **真机验证（最重要）**：`docs/06` 里的 M0 探针 V1–V8 一个都还没跑。**手机能不能跑得动本地模型，目前只有推断，没有数据。** 这是最大的未知。
+1. **真机验证（最重要）**：`docs/06` 里的 M0 探针 V1–V8 一个都还没跑。**手机能不能跑得动本地模型，目前只有推断，没有数据。** 这是最大的未知。探针页已经写好并随站点一起部署，缺的只是「拿手机打开它、把报告发回来」这一步。
 2. **部署**：两个 workflow 已经写好（GitHub Pages / Cloudflare Pages），需要一个仓库和两个 secret 才能跑。
 3. **手机端体验打磨**：横竖屏、锁屏中断恢复、长时间会话的内存回收。
 

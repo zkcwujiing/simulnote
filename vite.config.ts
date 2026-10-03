@@ -70,6 +70,13 @@ export default defineConfig({
     // 模型不在 bundle 里，但 transformers.js 的 JS 本体较大，放宽警告阈值。
     chunkSizeWarningLimit: 2000,
     rollupOptions: {
+      // 两个入口：主应用（index.html）与 M0 可行性探针（probe.html）。
+      // 探针页要和主站一起部署 —— 真机测试时用户只要在链接后面加 /probe.html，
+      // 不需要再跑一次本地服务器。它不碰主应用状态，只是多一个页面。
+      input: {
+        main: fileURLToPath(new URL('./index.html', import.meta.url)),
+        probe: fileURLToPath(new URL('./probe.html', import.meta.url)),
+      },
       output: {
         manualChunks: {
           // 让 transformers.js 单独成一个 chunk，首屏不必下载它
