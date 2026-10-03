@@ -4,11 +4,12 @@
  * 定位：**隐私模式 / 无网可用 / 浏览器没有原生识别的兜底**。
  * 与原生识别的取舍：
  *  - 优点：音频完全不出设备；离线可用；识别质量对小模型来说相当好。
- *  - 代价：首次要下 40–80MB 量化模型；手机上单句解码 0.5–2s，
- *    因此**不做逐字草稿**（supportsPartial=false），只在每句话说完后出结果。
+ *  - 代价：首次要下约 45MB 量化模型（模型随站点发布，见 lib/modelSource.ts）；
+ *    手机上单句解码 0.5–2s，因此**不做逐字草稿**（supportsPartial=false），
+ *    只在每句话说完后出结果。
  *
- * 模型选择策略：候选表依次尝试。HF 上模型改名/下架是常态，
- * 硬编码单一 id 迟早会让整个应用变砖 —— 这是同类项目常见的坑。
+ * 模型选择策略：模型由构建期拉进 public/models/ 并随站点发布，所以候选表
+ * 必须与 scripts/fetch-models.mjs 的清单保持一致 —— 见 WHISPER_MODELS 的注释。
  */
 
 import type { FinalSegment } from '@/types';
@@ -21,6 +22,7 @@ import type {
 } from '../types';
 import { log } from '@/lib/logger';
 import { configureOrtWasm, type OrtDtype } from '@/lib/ortEnv';
+import { configureModelSource } from '@/lib/modelSource';
 import { isLikelyMobile } from '@/lib/device';
 
 /** 按「小 → 稍大」排列；先用最小的把流程跑通，用户可在设置里升级。 */
@@ -32,11 +34,24 @@ export interface WhisperModelSpec {
   englishOnly: boolean;
 }
 
+/**
+ * 候选表。**只列本站真的托管了的模型** —— 模型现在随站点发布，
+ * 不在这里的 id 在浏览器里根本不存在，列出来只会变成一串 404。
+ *
+ * 想加候选（比如质量更好的 whisper-base.en）：
+ *   1. 在 `scripts/fetch-models.mjs` 的 MODELS 里加上它和它的文件清单；
+ *   2. 跑 `pnpm fetch-models` 把权重要下来；
+ *   3. 再回到这里补一行，并把 approxBytes 改成实测值。
+ * 注意站点体积会跟着涨 —— 每个模型都是几十 MB，而这是朋友首访要下的量。
+ */
 export const WHISPER_MODELS: WhisperModelSpec[] = [
-  { id: 'Xenova/whisper-tiny.en', label: 'Whisper Tiny（英文，~45MB）', approxBytes: 45 * 1024 * 1024, englishOnly: true },
-  { id: 'onnx-community/whisper-tiny.en', label: 'Whisper Tiny（英文·社区版，~45MB）', approxBytes: 45 * 1024 * 1024, englishOnly: true },
-  { id: 'Xenova/whisper-base.en', label: 'Whisper Base（英文，~80MB）', approxBytes: 80 * 1024 * 1024, englishOnly: true },
-  { id: 'Xenova/whisper-tiny', label: 'Whisper Tiny（多语言，~45MB）', approxBytes: 45 * 1024 * 1024, englishOnly: false },
+  {
+    id: 'Xenova/whisper-tiny.en',
+    label: 'Whisper Tiny（英文，42 MB）',
+    // 13 个文件的实测总字节数，见 scripts/fetch-models.mjs 的清单
+    approxBytes: 44_456_527,
+    englishOnly: true,
+  },
 ];
 
 type TranscriberOutput = { text: string };
@@ -121,7 +136,8 @@ export class TransformersWhisperAsrEngine implements AsrEngine {
       return found ?? {
         id: this.options.modelId,
         label: this.options.modelId,
-        approxBytes: 45 * 1024 * 1024,
+        // 不在清单里的 id —— 站点没托管它，多半会 404。给个粗估值只为进度条不报错。
+        approxBytes: WHISPER_MODELS[0].approxBytes,
         englishOnly: this.options.modelId.endsWith('.en'),
       };
     }
@@ -133,10 +149,9 @@ export class TransformersWhisperAsrEngine implements AsrEngine {
 
     const { pipeline, env } = await import('@huggingface/transformers');
 
-    // 模型一律走 HF Hub 远程拉取 + 浏览器 Cache API 缓存。
-    env.allowRemoteModels = true;
-    env.allowLocalModels = false;
-    env.useBrowserCache = true;
+    // 模型从本站自己的 /models/ 读（构建期由 scripts/fetch-models.mjs 放进去）。
+    // 原因见 lib/modelSource.ts：huggingface.co 在国内完全不通，直接拉必然超时。
+    configureModelSource(env);
 
     // 若构建时外置了 ORT 的 wasm（Cloudflare Pages 有 25MiB 单文件上限），
     // 这里把基址交给 ORT。不设 VITE_ORT_WASM_BASE 时是空操作。

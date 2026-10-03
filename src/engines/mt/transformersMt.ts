@@ -15,6 +15,7 @@
 import type { EngineAvailability, MtEngine, ProgressFn } from '../types';
 import { log } from '@/lib/logger';
 import { configureOrtWasm, type OrtDtype } from '@/lib/ortEnv';
+import { configureModelSource } from '@/lib/modelSource';
 import { shouldUseLightweightModels } from '@/lib/device';
 
 interface MtModelSpec {
@@ -27,26 +28,19 @@ interface MtModelSpec {
   langArgs?: Record<string, string>;
 }
 
+/**
+ * 候选表。**只列本站真的托管了的模型** —— 模型随站点发布，见 lib/modelSource.ts。
+ * nllb（600MB）和 m2m100（450MB）没有并进站点：它们会让朋友首访多下半个 GB，
+ * 而 opus-mt 在「听得懂、不出错译」这条线上已经够用（docs/results/V4.md 的实测口径）。
+ * 真想换更强的模型，先把权重要进 scripts/fetch-models.mjs 的清单。
+ */
 export const MT_MODELS: MtModelSpec[] = [
   {
     id: 'Xenova/opus-mt-en-zh',
-    label: 'Opus-MT 英中（~80MB，最快）',
-    approxBytes: 80 * 1024 * 1024,
+    label: 'Opus-MT 英中（117 MB，最快）',
+    // 11 个文件的实测总字节数，见 scripts/fetch-models.mjs 的清单
+    approxBytes: 122_857_604,
     kind: 'marian',
-  },
-  {
-    id: 'Xenova/nllb-200-distilled-600M',
-    label: 'NLLB-200 蒸馏版（~600MB，质量更好）',
-    approxBytes: 600 * 1024 * 1024,
-    kind: 'multilingual',
-    langArgs: { src_lang: 'eng_Latn', tgt_lang: 'zho_Hans' },
-  },
-  {
-    id: 'Xenova/m2m100_418M',
-    label: 'M2M-100（~450MB）',
-    approxBytes: 450 * 1024 * 1024,
-    kind: 'multilingual',
-    langArgs: { src_lang: 'en', tgt_lang: 'zh' },
   },
 ];
 
@@ -104,7 +98,8 @@ export class TransformersMtEngine implements MtEngine {
       found ?? {
         id: this.options.modelId,
         label: this.options.modelId,
-        approxBytes: 80 * 1024 * 1024,
+        // 不在清单里的 id —— 站点没托管它，多半会 404。给个粗估值只为进度条不报错。
+        approxBytes: MT_MODELS[0].approxBytes,
         kind: this.options.modelId.includes('nllb') || this.options.modelId.includes('m2m')
           ? 'multilingual'
           : 'marian',
@@ -135,9 +130,8 @@ export class TransformersMtEngine implements MtEngine {
     if (this.translator) return;
 
     const { pipeline, env } = await import('@huggingface/transformers');
-    env.allowRemoteModels = true;
-    env.allowLocalModels = false;
-    env.useBrowserCache = true;
+    // 与 ASR 引擎同一套来源规则：只从本站 /models/ 读，不回落到 HF。见 lib/modelSource.ts
+    configureModelSource(env);
 
     // 与 ASR 引擎共用同一份 wasm 外置配置（见 lib/ortEnv.ts）
     configureOrtWasm(env);

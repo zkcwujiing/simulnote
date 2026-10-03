@@ -435,8 +435,8 @@ export default function ProbeApp() {
         </Section>
 
         <Section
-          title="⑤ V2 / V4 · 本地模型实测（会下载几十到几百 MB）"
-          hint="第一次跑要等下载。RTF = 推理耗时 ÷ 音频时长，小于 1 才叫「比实时快」。"
+          title="⑤ V2 / V4 · 本地模型实测（会从本站下载几十到一百多 MB）"
+          hint="第一次跑要等下载。模型随站点发布，不访问任何外部服务。RTF = 推理耗时 ÷ 音频时长，小于 1 才叫「比实时快」。"
         >
           <div className="grid gap-2 text-xs text-slate-300">
             <label className="grid gap-1">
@@ -446,11 +446,12 @@ export default function ProbeApp() {
                 value={whisperModel}
                 onChange={(e) => setWhisperModel(e.target.value)}
               >
-                <option value="Xenova/whisper-tiny.en">Xenova/whisper-tiny.en（约 45 MB）</option>
-                <option value="onnx-community/whisper-tiny.en">onnx-community/whisper-tiny.en</option>
-                <option value="Xenova/whisper-base.en">Xenova/whisper-base.en（约 80 MB）</option>
-                <option value="Xenova/whisper-tiny">Xenova/whisper-tiny（多语言，约 45 MB）</option>
+                <option value="Xenova/whisper-tiny.en">Xenova/whisper-tiny.en（42 MB）</option>
               </select>
+              <span className="text-xs text-slate-400">
+                只列本站托管了的模型（scripts/fetch-models.mjs 的清单）。测别的 id 会直接报
+                ModelFileNotFoundError。
+              </span>
             </label>
             <label className="grid gap-1">
               <span>后端</span>
@@ -490,12 +491,11 @@ export default function ProbeApp() {
                 value={mtModel}
                 onChange={(e) => setMtModel(e.target.value)}
               >
-                <option value="Xenova/opus-mt-en-zh">Xenova/opus-mt-en-zh（约 80 MB，en 专用）</option>
-                <option value="Xenova/nllb-200-distilled-600M">
-                  Xenova/nllb-200-distilled-600M（约 600 MB，多语言）
-                </option>
-                <option value="Xenova/m2m100_418M">Xenova/m2m100_418M（约 400 MB，多语言）</option>
+                <option value="Xenova/opus-mt-en-zh">Xenova/opus-mt-en-zh（117 MB，en 专用）</option>
               </select>
+              <span className="text-xs text-slate-400">
+                同样只列本站托管了的模型。nllb / m2m100 没有并进站点 —— 那会让朋友首访多下半个 GB。
+              </span>
             </label>
           </div>
           <div className="mt-3">

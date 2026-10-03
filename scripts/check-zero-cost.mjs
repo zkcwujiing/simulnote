@@ -11,8 +11,12 @@
  *   1. 源码里出现的每一个外部主机名，必须在 ALLOWED_HOSTS 里。
  *   2. 源码里不允许出现任何形似密钥的字符串。
  *
- * 允许 Hugging Face 是刻意的：模型权重必须从某处下载，HF 是免费公开的，
- * 而且只发生在首次使用时。除此之外不该有任何外部依赖。
+ * **模型现在随站点一起发布**（构建期由 scripts/fetch-models.mjs 拉进 public/models/，
+ * 见该脚本头部说明）。也就是说：运行时不访问任何外部服务 ——
+ * 连 huggingface.co 都不在允许清单里了。这份清单越短，承诺越硬。
+ * 清单里剩下的 github.com 只服务于一个可选项：把 26.8MB 的 ORT wasm 外置到
+ * 本仓库自己的 Release（Cloudflare Pages 有 25MiB 单文件上限，GitHub Pages 没有）。
+ * 默认部署根本不走这条路。
  */
 
 import { readdir, readFile, stat } from 'node:fs/promises';
@@ -26,17 +30,13 @@ const SCAN_DIRS = ['src', 'public'];
 const SCAN_FILES = ['index.html', 'probe.html'];
 const SKIP_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp', '.ico', '.woff', '.woff2', '.onnx', '.wasm', '.mp3']);
 
-/** 允许出现的外部主机：模型权重 CDN，以及本项目自己的静态资产托管。 */
+/** 允许出现的外部主机：只剩「本项目自己的 GitHub Release 资产」这一类。 */
 const ALLOWED_HOSTS = [
-  'huggingface.co',
-  'hf.co',
-  // HF 的大文件实际由 LFS CDN 提供，域名随区域变化，统一按后缀放行
-  '.huggingface.co',
-  '.hf.co',
   // 仅用于「本仓库自己的 GitHub Release 资产」（ORT 的 wasm 体积超过
   // Cloudflare Pages 的 25MiB 单文件上限，只能外置）。免费、无需账号、无配额费用。
   // 注意：这是**我们自己的**仓库，不是第三方 API；github.com 上的 Release 下载会
   // 302 跳到 objects.githubusercontent.com，所以两个都要放行。
+  // 默认部署（GitHub Pages）根本用不到这些：wasm 直接打包进站点。
   'github.com',
   'objects.githubusercontent.com',
   'release-assets.githubusercontent.com',
@@ -87,6 +87,10 @@ async function collectFiles() {
     }
     for (const entry of entries) {
       const full = path.join(dir, entry.name);
+      // public/models/ 是构建期拉下来的模型权重（见 scripts/fetch-models.mjs）。
+      // 它们不进 git，也不含任何 URL；扫进来只会让「扫描 N 个文件」这个数字失真。
+      const relFromRoot = path.relative(ROOT, full).replace(/\\/g, '/');
+      if (relFromRoot === 'public/models' || relFromRoot.startsWith('public/models/')) continue;
       if (entry.isDirectory()) {
         if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue;
         await walk(full);

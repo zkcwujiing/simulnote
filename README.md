@@ -29,6 +29,7 @@
 | 决策点 | 选择 | 一句话理由 |
 |---|---|---|
 | 部署形态 | 纯浏览器端静态站（**无服务端**） | 唯一能同时满足「免费」「发链接就能用」「无服务器成本」的形态 |
+| 模型来源 | **自托管**：构建期下进 `public/models/`，随站点发布 | Hugging Face CDN 在国内实测 **0/3 不通**，直下模型会让站点变成砖（[`docs/07`](docs/07-风险与对策.md) R15） |
 | 识别引擎 | 分层渐进增强（浏览器原生 API → 本地 ONNX/WASM 模型） | 不同设备能力差巨大，必须降级而不是二选一 |
 | 翻译引擎 | 桌面走 Chrome 内置 Translator API，移动端走本地 opus-mt | 内置 API 快且免费但**不支持手机**，必须有兜底 |
 | 摘要引擎 | 本地小模型生成式摘要 + **TextRank 抽取式兜底** | 保证任何设备都能出纪要，永不失败 |
@@ -56,9 +57,15 @@
 
 ```bash
 pnpm install
+pnpm fetch-models  # 把 24 个模型文件（159.6 MB）下到 public/models/；只需一次
 pnpm dev          # 主应用：http://localhost:5173
                   # M0 探针：http://localhost:5173/probe.html
 ```
+
+> **`pnpm fetch-models` 不能省。** 模型是**自托管**的（原因见 [`docs/07`](docs/07-风险与对策.md) R15：
+> Hugging Face 在国内实测 0/3 不通），运行时只从本站的 `/models/...` 取，不访问任何外部服务。
+> 模型不进 git（仓库保持几百 KB），所以换一台机器就得重跑一次。
+> `pnpm fetch-models --check` 是**离线**体检，只查文件在不在，不联网。
 
 麦克风需要「安全上下文」：`localhost` 可以，`file://` 打开**不行**。
 
@@ -68,7 +75,7 @@ Markdown 报告。它不碰主应用状态，也不会把数据发出去。手�
 加 `/probe.html`，用手机打开、跑完、把报告发回来。
 
 ```bash
-pnpm build        # 类型检查 + 生产构建，产物在 dist/
+pnpm build        # 模型体检 + 类型检查 + 生产构建，产物在 dist/（约 186 MB）
 pnpm preview      # 本地预览构建产物
 pnpm lint:cost    # 零成本护栏：扫描源码里有没有偷偷引入付费 API / 密钥
 pnpm lint:size    # 上传体积闸门：Cloudflare Pages 单文件上限 25 MiB
@@ -80,7 +87,7 @@ pnpm verify       # 上面三件事一起跑
 
 ## 6. 当前状态
 
-**阶段：M1 最小闭环已跑通 —— 代码可以构建、可以本地运行，尚未在真机上验证过识别质量。**
+**阶段：M1 最小闭环已跑通 —— 代码可以构建、可以本地运行、模型能从本站加载，尚未在真机上验证过识别质量。**
 
 已完成：
 
@@ -88,24 +95,27 @@ pnpm verify       # 上面三件事一起跑
 |---|---|
 | 采集 | `src/lib/audio/capture.ts`（AudioWorklet 重采样到 16 kHz 单声道，带 ScriptProcessor 降级）、`public/pcm-worklet.js` |
 | 断句 | `src/lib/audio/vad.ts`（能量法 VAD，自适应噪声底，零下载零依赖） |
-| 识别 | 浏览器原生识别 `asr-webSpeech`（`privacy: network`）、本地 Whisper `asr-whisper-local`（`privacy: on-device`，多候选模型依次回退） |
-| 翻译 | 浏览器内置翻译 `mt-chrome-builtin`、本地 opus-mt `mt-local-transformer`（同样多候选回退） |
+| 识别 | 浏览器原生识别 `asr-webSpeech`（`privacy: network`）、本地 Whisper `asr-whisper-local`（`privacy: on-device`，模型 `Xenova/whisper-tiny.en`，42 MB） |
+| 翻译 | 浏览器内置翻译 `mt-chrome-builtin`、本地 opus-mt `mt-local-transformer`（模型 `Xenova/opus-mt-en-zh`，117 MB） |
 | 纪要 | `sum-extractive-textrank`：TextRank + MMR 抽取式摘要；**关键数字由 `sum/facts.ts` 从英文原文按规则抽取**，不经过翻译模型 |
 | 决策 | `src/engines/registry.ts`：三档模式（自动 / 完全本地 / 最快启动），探测顺序即优先级，**任何一环都允许降级，绝不白屏** |
+| 模型 | `src/lib/modelSource.ts` 统一配置模型来源（`allowRemoteModels=false` 是护栏）、`scripts/fetch-models.mjs` 负责构建期下载 |
 | 界面 | 环境探测面板、实时双语滚动（虚拟列表）、纪要视图、Markdown/纯文本导出、分享二维码 |
 | 护栏 | `scripts/check-zero-cost.mjs`（零成本）、`scripts/check-upload-size.mjs`（部署体积） |
 | 验证 | `probe.html` + `src/probe/`：M0 探针页，**已就绪、待真机运行** |
 
-构建实测：`pnpm build` 通过（`tsc -b` 无错误，两个入口 `index.html` + `probe.html`，约 0.98 MB JS/CSS + 26.8 MB 的 ONNX Runtime wasm）。
+构建实测：`pnpm build` 通过（`tsc -b` 无错误，两个入口 `index.html` + `probe.html`）；
+完整产物 **43 个文件 / 186.28 MB**，其中 24 个是自托管模型（159.6 MB），最大的是 26.8 MB 的 ONNX Runtime wasm。
 
 ### 还没做的（也是接下来最该做的）
 
 1. **真机验证（最重要）**：`docs/06` 里的 M0 探针 V1–V8 一个都还没跑。**手机能不能跑得动本地模型，目前只有推断，没有数据。** 这是最大的未知。探针页已经写好并随站点一起部署，缺的只是「拿手机打开它、把报告发回来」这一步。
-2. **部署**：两个 workflow 已经写好（GitHub Pages / Cloudflare Pages），需要一个仓库和两个 secret 才能跑。
+2. **部署**：两个 workflow 已经写好（GitHub Pages / Cloudflare Pages），**只需要一个 GitHub 仓库**——模型由 CI 自己下，不需要任何 secret。步骤见 [`docs/10-上线清单.md`](docs/10-上线清单.md)。
 3. **手机端体验打磨**：横竖屏、锁屏中断恢复、长时间会话的内存回收。
 
-### 三个必须知道的事实
+### 四个必须知道的事实
 
-1. **Cloudflare Pages 有 25 MiB 单文件上限**，而 transformers.js 会带出一个 26.8 MB 的 `ort-wasm-simd-threaded.asyncify.wasm`。**GitHub Pages 没有这个限制。** 因此：要么优先用 GitHub Pages 那个链接，要么把 wasm 外置成本仓库的 Release 资产（`docs/09` 有完整步骤）。
-2. **Chrome 内置翻译 API 不支持手机**（只支持桌面 Chrome 138+ / Edge 148+，且要求 16GB 内存）。所以手机上只能走本地模型或浏览器原生识别 —— 这正是 `docs/03` 设计四层降级链的原因。
-3. **小模型翻译数字不可靠**（hayamimi 官方 Limitations 原文："numeric values are not reliably preserved"）。本项目的对策是**数字完全绕开翻译模型**，从英文原文按规则抽取并生成对照表。
+1. **模型自己托管，首访要下 160 MB。** Hugging Face CDN 在国内实测 0/3 不通（DNS 污染 + SNI 阻断），所以 `scripts/fetch-models.mjs` 在**构建期**把 24 个文件拉到 `public/models/` 随站点发布，运行时 `allowRemoteModels=false`，**不访问任何外部服务**。好处是「朋友能不能用」不再取决于他能否连上 HF；代价是站点变成 186 MB，GitHub Pages 的 100 GB/月带宽 ≈ **550 次完整首访/月**，这是现在要盯的指标。复访走 Cache Storage，不再花流量。
+2. **Cloudflare Pages 有 25 MiB 单文件上限，而且现在有 4 个文件超限。** 除了 26.8 MB 的 `ort-wasm-simd-threaded.asyncify.wasm`（这个能外置成本仓库的 Release 资产），还有 3 个模型 `.onnx`（29 / 50 / 57 MB）——**它们没有外置方案**，因为外置就等于回到「运行时从第三方 CDN 取权重」。**所以 GitHub Pages 是唯一无损路线。**
+3. **Chrome 内置翻译 API 不支持手机**（只支持桌面 Chrome 138+ / Edge 148+，且要求 16GB 内存）。所以手机上只能走本地模型或浏览器原生识别 —— 这正是 `docs/03` 设计四层降级链的原因。另外 Chrome 的原生识别在**国内同样不通**（音频要发往 Google 服务器）。
+4. **小模型翻译数字不可靠**（hayamimi 官方 Limitations 原文："numeric values are not reliably preserved"）。本项目的对策是**数字完全绕开翻译模型**，从英文原文按规则抽取并生成对照表。

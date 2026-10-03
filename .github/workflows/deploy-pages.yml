@@ -36,6 +36,37 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
 
+      - name: Zero-cost guard
+        run: pnpm lint:cost
+
+      # 模型不进 git（仓库保持几百 KB），在构建期补进来，随站点一起发布。
+      # 这样运行时**不访问任何外部服务** —— 国内的浏览器根本连不上 huggingface.co，
+      # 若让浏览器自己去下模型，用户会卡在「正在下载模型」然后退化成「只转写、不翻译」。
+      #
+      # 用 restore/save 而不是 cache@v4：fetch 中途失败时绝不能把残缺的目录写进缓存，
+      # 否则之后每次构建都会「命中缓存 → 跳过下载 → 打出缺文件的站点」。
+      # 缓存键跟着清单脚本走：清单变了才重下。
+      - name: Restore model cache
+        id: model-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: public/models
+          key: models-${{ hashFiles('scripts/fetch-models.mjs') }}
+
+      - name: Fetch models（约 160MB，随站点发布）
+        # 构建机在海外，huggingface.co 直连比镜像快，所以这里把它提到第一位；
+        # 脚本内部仍会在两个源之间自动重试，已下好的文件按大小校验后跳过。
+        env:
+          HF_HOST: https://huggingface.co
+        run: pnpm fetch-models
+
+      - name: Save model cache
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: public/models
+          key: models-${{ hashFiles('scripts/fetch-models.mjs') }}
+
       - name: Build
         # 项目站点部署在 /<仓库名>/ 子路径下，base 必须跟着走，否则所有
         # 静态资源都会 404（这是 GitHub Pages 项目站最常见的坑）。
@@ -49,9 +80,6 @@ jobs:
           VITE_BASE: /${{ github.event.repository.name }}/
           VITE_SITE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
         run: pnpm build
-
-      - name: Zero-cost guard
-        run: pnpm lint:cost
 
       - uses: actions/configure-pages@v5
 

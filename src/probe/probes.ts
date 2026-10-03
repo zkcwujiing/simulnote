@@ -7,7 +7,13 @@
  * 3. **失败也要出数据**：任何探针抛错都记录成结论，而不是让整页崩掉。
  * 4. **能自己算的就自己算**：设备画像、内存上限、存储配额、RTF 都是数字；
  *    只有「翻译质量」「摘要命中率」需要人看，所以把原文和译文并排贴出来。
+ *
+ * 注意：探针和主应用一样，模型只从本站 `/models/` 读（见 lib/modelSource.ts），
+ * 所以这里能测的模型 = `scripts/fetch-models.mjs` 清单里的那些。
+ * 测别的 id 会立刻报 `ModelFileNotFoundError`，那不是坏了，是本站没托管它。
  */
+
+import { configureModelSource } from '@/lib/modelSource';
 
 export type ProbeState = 'idle' | 'running' | 'pass' | 'warn' | 'fail' | 'skip';
 
@@ -553,9 +559,7 @@ export async function benchWhisper(opts: WhisperBenchOptions): Promise<ModelTimi
     const { pipeline, env } = mod;
     opts.onNote?.(`模块加载完成（${Math.round(performance.now() - t0)} ms）`);
 
-    env.allowRemoteModels = true;
-    env.allowLocalModels = false;
-    env.useBrowserCache = true;
+    configureModelSource(env);
 
     let bytes = 0;
     let firstProgressAt: number | null = null;
@@ -638,9 +642,7 @@ export async function benchMt(opts: {
   try {
     opts.onNote?.('动态导入 @huggingface/transformers …');
     const { pipeline, env } = await import('@huggingface/transformers');
-    env.allowRemoteModels = true;
-    env.allowLocalModels = false;
-    env.useBrowserCache = true;
+    configureModelSource(env);
 
     const loadStart = performance.now();
     const translator = await pipeline('translation', opts.modelId, {

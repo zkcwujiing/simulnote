@@ -11,6 +11,11 @@ dev-dist
 .tmp
 *.tsbuildinfo
 
+# 自托管的模型权重（约 167 MB，由 `pnpm fetch-models` 在构建前拉下来）。
+# 绝不入库：仓库保持几百 KB，push 才不会因为跨境丢包反复失败。
+# 部署时由 .github/workflows/deploy-pages.yml 自动补齐。
+public/models/
+
 # 本地环境与编辑器
 *.local
 .DS_Store

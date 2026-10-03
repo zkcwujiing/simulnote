@@ -3,10 +3,15 @@
  * 上传体积闸门（`node scripts/check-upload-size.mjs`）。
  *
  * 存在的理由：Cloudflare Pages 对单个文件的上限是 **25 MiB**，超限时它只会丢回
- * 一句没什么信息量的报错，而产物里恰好躺着一个 26.8MB 的
- * `ort-wasm-simd-threaded.asyncify.wasm`（transformers.js 带出来的）。
+ * 一句没什么信息量的报错。产物里有两类文件会踩这条线：
+ *   1. `ort-wasm-simd-threaded.asyncify.wasm`（**26.8MB**，transformers.js 带出来的）；
+ *   2. 自托管模型（`models/` 下的 `.onnx`，30–60MB 一个）—— 见 scripts/fetch-models.mjs。
  * 与其让部署在云厂商那边莫名其妙地挂掉，不如在本地就把话说清楚：
  * 是哪个文件、超了多少、怎么办。
+ *
+ * ⚠️ **走 GitHub Pages 时这一条根本不存在** —— 它没有单文件上限。
+ * 所以本脚本的结论只在 Cloudflare 那条路上要紧；`pnpm verify` 用 `--warn-only`
+ * 调用它，就是为了不让「另一个源站的问题」打断主路线。
  *
  * 用 `--limit-mb=<n>` 可以改阈值；`--warn-only` 只警告不失败。
  */
@@ -69,18 +74,41 @@ if (oversized.length === 0) {
   process.exit(0);
 }
 
-console.error('\n以下文件超过单文件上限，Cloudflare Pages 会拒绝这次部署：');
-for (const item of oversized) {
-  console.error(`  - ${item.file}  ${mb(item.size)} MB（超出 ${mb(item.size - LIMIT_BYTES)} MB）`);
+// 超限的两种来源，处理方式完全不同，所以分开说：
+//   - wasm：ONNX Runtime 带出来的，和路线无关，走哪条路都得先解决
+//   - models/：**自托管模型本来就是几十 MB**，它只在 Cloudflare Pages 上是问题
+const wasm = oversized.filter((i) => i.file.endsWith('.wasm'));
+const models = oversized.filter((i) => !i.file.endsWith('.wasm'));
+
+console.log(`  ⚠ ${oversized.length} 个文件超过单文件上限（wasm ${wasm.length} 个，模型 ${models.length} 个）`);
+
+if (wasm.length > 0) {
+  console.log('\n■ ONNX Runtime 的 wasm（只有 1 个，且可以外置）：');
+  for (const item of wasm) {
+    console.log(`  - ${item.file}  ${mb(item.size)} MB（超出 ${mb(item.size - LIMIT_BYTES)} MB）`);
+  }
 }
-console.error(
+
+if (models.length > 0) {
+  console.log('\n■ 自托管模型（模型随站点发布，本来就是几十 MB —— 只在 Cloudflare 上是问题）：');
+  for (const item of models) {
+    console.log(`  - ${item.file}  ${mb(item.size)} MB（超出 ${mb(item.size - LIMIT_BYTES)} MB）`);
+  }
+}
+
+console.log(
   [
     '',
-    '处理办法（二选一）：',
-    '  1. 只用 GitHub Pages 的链接 —— 它没有单文件上限，功能完全一样。',
-    '  2. 把上面的 .wasm 上传为本仓库的一个 GitHub Release 资产，然后设置',
-    '     仓库变量 VITE_ORT_WASM_BASE=https://github.com/<你>/<仓库>/releases/download/<tag>/',
-    '     重新构建即可（vite.config.ts 会把它从产物里剔除，运行时由 lib/ortEnv.ts 提供）。',
+    '怎么理解这个结果：',
+    '  · 走 **GitHub Pages**（推荐的那条）：它**没有单文件上限**，上面这些全都不影响，',
+    '    功能完全一样。这一整段可以直接忽略。',
+    '  · 走 Cloudflare Pages：这些文件会被直接拒收，必须先处理掉。两条出路：',
+    '      1. 放弃 Cloudflare，只用 GitHub Pages 的链接。',
+    '      2. wasm 可以外置成 Release 资产（见下）；但模型文件目前没有外置方案，',
+    '         要么接受 Cloudflare 不可用，要么把模型清单改小（比如只留 whisper）。',
+    '           把 .wasm 上传为本仓库的一个 GitHub Release 资产，然后设置仓库变量',
+    '           VITE_ORT_WASM_BASE=https://github.com/<你>/<仓库>/releases/download/<tag>/',
+    '           重新构建即可（vite.config.ts 会把它从产物里剔除，运行时由 lib/ortEnv.ts 提供）。',
     '',
   ].join('\n'),
 );
