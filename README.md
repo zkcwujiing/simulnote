@@ -3,6 +3,9 @@
 > **一句话定位**：打开一个网页链接，对着麦克风说英文，屏幕上实时滚动中文翻译；说完之后，自动生成这段内容的中文要点纪要。
 > **零成本承诺**：不依赖任何付费 API，所有 AI 计算跑在使用者自己的浏览器里，托管在免费静态托管平台。
 
+**🔗 已经在线的站点**：<https://zkcwujiing.github.io/simulnote/> ｜ 可行性探针页 <https://zkcwujiing.github.io/simulnote/probe.html>
+（部署与换机器重走的完整步骤见 [`docs/10-上线清单.md`](docs/10-上线清单.md)）
+
 ---
 
 ## 1. 项目是什么
@@ -109,8 +112,13 @@ pnpm verify       # 上面三件事一起跑
 
 ### 还没做的（也是接下来最该做的）
 
-1. **真机验证（最重要）**：`docs/06` 里的 M0 探针 V1–V8 一个都还没跑。**手机能不能跑得动本地模型，目前只有推断，没有数据。** 这是最大的未知。探针页已经写好并随站点一起部署，缺的只是「拿手机打开它、把报告发回来」这一步。
-2. **部署**：两个 workflow 已经写好（GitHub Pages / Cloudflare Pages），**只需要一个 GitHub 仓库**——模型由 CI 自己下，不需要任何 secret。步骤见 [`docs/10-上线清单.md`](docs/10-上线清单.md)。
+1. **真机验证（最重要）**：`docs/06` 里的 M0 探针 V1–V8 一个都还没跑。**手机能不能跑得动本地模型，目前只有推断，没有数据。** 这是最大的未知。探针页已经写好并且**已经在线**——手机直接打开 <https://zkcwujiing.github.io/simulnote/probe.html>，跑完把报告发回来即可。
+2. **部署 —— 已完成** ✅：`main` 分支已推到 <https://github.com/zkcwujiing/simulnote>，GitHub Actions 的 `Deploy to GitHub Pages` 跑绿，站点上线于 <https://zkcwujiing.github.io/simulnote/>。
+   > 唯一一个必须**手动做一次**的动作：仓库 **Settings → Pages → Source 选 "GitHub Actions"**。
+   > 这一步没做的话，流水线的 Install / Fetch models / Build 全绿，只在最后的 `configure-pages` 红掉，
+   > 报 `Create Pages site failed. Error: Resource not accessible by integration` ——
+   > 因为创建 Pages 站点需要管理员权限，CI 的 `GITHUB_TOKEN` 永远没有（`enablement: true` 也救不了）。详见 [`docs/10-上线清单.md`](docs/10-上线清单.md) 第 3 步。
+   > Cloudflare Pages 那份 workflow 仍然保留但改成手动触发，理由见 [`docs/08-零成本方案与分享方式.md`](docs/08-零成本方案与分享方式.md)。
 3. **手机端体验打磨**：横竖屏、锁屏中断恢复、长时间会话的内存回收。
 
 ### 四个必须知道的事实
