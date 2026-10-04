@@ -313,6 +313,7 @@ export default function ProbeApp() {
           '下载体积': fmtBytes(r.downloadedBytes),
           '推理耗时（ms）': r.inferMs,
           RTF: r.rtf,
+          'ORT 运行时来源': r.ortRuntime ?? '—',
           '识别输出（合成音频，仅证明链路通，不代表质量）': r.text?.slice(0, 200) ?? '—',
         },
       };
@@ -347,6 +348,7 @@ export default function ProbeApp() {
           '平均耗时/句': fmtMs(r.meanMs),
           '吞吐（句/秒）': r.throughputPerSec ?? '—',
           '单句耗时（ms）': r.perSentenceMs.join(', ') || '—',
+          'ORT 运行时来源': r.ortRuntime ?? '—',
           '产物样例（空字符串通常意味着需要用带语言前缀的模型）': r.outputs[0] ?? '—',
         },
         samples: pairs,

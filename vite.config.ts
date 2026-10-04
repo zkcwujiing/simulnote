@@ -2,26 +2,25 @@ import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import { fileURLToPath, URL } from 'node:url';
+import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
 
 // GitHub Pages 的项目站点部署在 /<仓库名>/ 子路径下，Cloudflare Pages 部署在根路径。
 // 因此 base 由环境变量注入：构建 GH Pages 版时设 VITE_BASE='/<仓库名>/'。
 const base = process.env.VITE_BASE || '/';
 
 /**
- * ONNX Runtime 的 wasm 外置策略。
+ * ONNX Runtime 的 wasm 外置策略（只管「太大」这一件事）。
  *
  * transformers.js v4 会让 Vite 顺带产出一个
- * `ort-wasm-simd-threaded.asyncify.wasm`，**26,861,777 字节**，
- * 超过 Cloudflare Pages 的 **25 MiB（26,214,400 字节）单文件上限**，
- * 不处理的话 Cloudflare 那边的部署会直接失败。
+ * `ort-wasm-simd-threaded.asyncify.wasm`，**26,861,777 字节**。
+ * 现在这个文件**永远不会被用到** —— `lib/ortEnv.ts` 会无条件把 ORT 的
+ * `wasmPaths` 指到 `/<base>/ort/`（真机实测：不指过去，ORT 就会去
+ * cdn.jsdelivr.net 取，手机上直接 `TypeError: Load failed`）。
+ * 所以这里把它从产物里删掉，免得白白多传 26.8 MB。
  *
- * 约定：只要设置了 `VITE_ORT_WASM_BASE`（例如指向本仓库 GitHub Release 的资产目录），
- * 就认为 wasm 由外部提供 —— 把它们从产物里删掉，运行时由 lib/ortEnv.ts 交给 ORT。
- * 没设这个变量时**行为完全不变**，wasm 正常打进站点（本地开发、GitHub Pages 都用这条）。
- *
- * 两个开关必须成对使用，不能只做一半：
- *   - 只删文件不设基址 → 本地模型直接加载失败；
- *   - 只设基址不删文件 → Cloudflare 上传被拒。
+ * 设置了 `VITE_ORT_WASM_BASE`（指向本仓库 GitHub Release 资产）时，
+ * 下面的 `ortRuntime()` 不会再往站点里拷 ORT 运行时，由外部提供。
  */
 const ORT_WASM_DROP_THRESHOLD = 12 * 1024 * 1024;
 
@@ -31,7 +30,6 @@ function ortWasmPolicy(): Plugin {
     name: 'simulnote:ort-wasm-policy',
     apply: 'build',
     generateBundle(_options, bundle) {
-      if (!externalBase) return;
       for (const [fileName, output] of Object.entries(bundle)) {
         if (output.type !== 'asset' || !fileName.endsWith('.wasm')) continue;
         const bytes =
@@ -42,8 +40,54 @@ function ortWasmPolicy(): Plugin {
         delete bundle[fileName];
         this.warn(
           `已从产物中剔除 ${fileName}（${(bytes / 1024 / 1024).toFixed(1)} MB）：` +
-            `改由 VITE_ORT_WASM_BASE=${externalBase} 在运行时提供。`,
+            (externalBase
+              ? `改由 VITE_ORT_WASM_BASE=${externalBase} 提供。`
+              : `改由站点自带的 /ort/ 目录提供（见 vite.config.ts 的 ortRuntime()）。`),
         );
+      }
+    },
+  };
+}
+
+/**
+ * 把 ONNX Runtime 的运行时（JS 胶水 + wasm）拷进产物，**放在站点自己的域下**。
+ *
+ * 为什么必须有这一步：transformers.js 在 `wasmPaths` 为空时会把它指到
+ * `https://cdn.jsdelivr.net/npm/onnxruntime-web@<版本>/dist/`。国内手机上那个
+ * CDN 连不上，报 `TypeError: Load failed`，而且看起来像是「模型加载失败」。
+ * 详见 `src/lib/ortEnv.ts` 的注释。
+ *
+ * 拷两份：
+ *   - asyncify 变体（26.8 MB）—— 默认，Android / iOS 26+ 都走这个
+ *   - 普通变体（14.3 MB）—— Safari < 26 且没有 WebGPU 时 ORT 会要这个
+ * 体积换的是「任何一台设备都不会因为 CDN 连不上而变成砖」。
+ */
+const ORT_RUNTIME_FILES = [
+  'ort-wasm-simd-threaded.asyncify.mjs',
+  'ort-wasm-simd-threaded.asyncify.wasm',
+  'ort-wasm-simd-threaded.mjs',
+  'ort-wasm-simd-threaded.wasm',
+];
+
+function ortRuntime(): Plugin {
+  const externalBase = (process.env.VITE_ORT_WASM_BASE || '').trim();
+  return {
+    name: 'simulnote:ort-runtime',
+    apply: 'build',
+    writeBundle(options) {
+      if (externalBase) return; // 由外部提供，站点里不放
+      const from = fileURLToPath(
+        new URL('./node_modules/onnxruntime-web/dist/', import.meta.url),
+      );
+      const to = join(options.dir ?? fileURLToPath(new URL('./dist', import.meta.url)), 'ort');
+      mkdirSync(to, { recursive: true });
+      for (const name of ORT_RUNTIME_FILES) {
+        const src = join(from, name);
+        if (!existsSync(src)) {
+          this.warn(`ORT 运行时缺少 ${name}，跳过（真机上可能加载失败）。`);
+          continue;
+        }
+        copyFileSync(src, join(to, name));
       }
     },
   };
@@ -72,7 +116,7 @@ function socialMeta(): Plugin {
 
 export default defineConfig({
   base,
-  plugins: [react(), tailwindcss(), ortWasmPolicy(), socialMeta()],
+  plugins: [react(), tailwindcss(), ortWasmPolicy(), ortRuntime(), socialMeta()],
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url)),

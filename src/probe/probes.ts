@@ -14,8 +14,31 @@
  */
 
 import { configureModelSource } from '@/lib/modelSource';
+import { configureOrtWasm } from '@/lib/ortEnv';
 
 export type ProbeState = 'idle' | 'running' | 'pass' | 'warn' | 'fail' | 'skip';
+
+/**
+ * 把实际生效的 ORT 运行时位置说成人话，写进报告。
+ *
+ * 加这一条是因为上一次真机翻车时，报告里只有一句 `TypeError: Load failed`，
+ * 完全看不出「ORT 的 wasm 其实被送到了 cdn.jsdelivr.net」——
+ * 结果把一个 CDN 连不上的问题误判成了模型问题。以后报告里必须有这一行。
+ */
+export function describeWasmPaths(value: string | Record<string, string> | null): string {
+  if (value === null) return '⚠️ 无法设置（transformers.js 版本过老），由 ORT 自行决定';
+  if (typeof value === 'string') return `外置基址 ${value}`;
+  const mjs = value.mjs ?? '';
+  const wasm = value.wasm ?? '';
+  const host = (() => {
+    try {
+      return new URL(mjs).host;
+    } catch {
+      return '（相对路径）';
+    }
+  })();
+  return `${host} → ${mjs.split('/').pop()} + ${wasm.split('/').pop()}`;
+}
 
 export interface ProbeResult {
   id: string;
@@ -504,6 +527,8 @@ export interface ModelTimingResult {
   audioSec: number;
   inferMs: number | null;
   text: string | null;
+  /** ORT 运行时实际从哪儿取（人话）。用来一眼看出有没有被送去第三方 CDN。 */
+  ortRuntime: string | null;
   error?: string;
 }
 
@@ -551,6 +576,7 @@ export async function benchWhisper(opts: WhisperBenchOptions): Promise<ModelTimi
     audioSec: opts.audioSec,
     inferMs: null,
     text: null,
+    ortRuntime: null,
   };
   try {
     opts.onNote?.('动态导入 @huggingface/transformers …');
@@ -560,6 +586,12 @@ export async function benchWhisper(opts: WhisperBenchOptions): Promise<ModelTimi
     opts.onNote?.(`模块加载完成（${Math.round(performance.now() - t0)} ms）`);
 
     configureModelSource(env);
+    const wasmPaths = configureOrtWasm(env);
+    opts.onNote?.(
+      `模型来源：本站 ${String((env as { localModelPath?: string }).localModelPath ?? '')}；` +
+        `ORT 运行时：${describeWasmPaths(wasmPaths)}`,
+    );
+    result.ortRuntime = describeWasmPaths(wasmPaths);
 
     let bytes = 0;
     let firstProgressAt: number | null = null;
@@ -619,6 +651,8 @@ export interface MtBenchResult {
   meanMs: number | null;
   throughputPerSec: number | null;
   outputs: string[];
+  /** ORT 运行时实际从哪儿取（人话）。 */
+  ortRuntime: string | null;
   error?: string;
 }
 
@@ -638,11 +672,15 @@ export async function benchMt(opts: {
     meanMs: null,
     throughputPerSec: null,
     outputs: [],
+    ortRuntime: null,
   };
   try {
     opts.onNote?.('动态导入 @huggingface/transformers …');
     const { pipeline, env } = await import('@huggingface/transformers');
     configureModelSource(env);
+    const wasmPaths = configureOrtWasm(env);
+    opts.onNote?.(`ORT 运行时：${describeWasmPaths(wasmPaths)}`);
+    result.ortRuntime = describeWasmPaths(wasmPaths);
 
     const loadStart = performance.now();
     const translator = await pipeline('translation', opts.modelId, {

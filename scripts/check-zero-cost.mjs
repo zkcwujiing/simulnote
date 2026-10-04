@@ -61,6 +61,23 @@ const NAMED_BAD_HOSTS = [
   'api.assemblyai.com',
   'api.rev.ai',
   'api.elevenlabs.io',
+  // ── 第三方静态资源 CDN ────────────────────────────────────
+  // 这一类原本不在名单里，因为「我们从不从 CDN 取东西」——结果就栽在这上面：
+  // transformers.js 会在 `env.wasm.wasmPaths` 为空时，**自动**把 ORT 的胶水和
+  // 26.8MB wasm 指向 cdn.jsdelivr.net（代码写死在它的 dist 里）。国内网络到
+  // jsdelivr 不通，真机上就表现为 `TypeError: Load failed`，而且这条字面量在
+  // node_modules 里，本脚本扫不到（见下面的 dist 扫描）。
+  // 修法是 src/lib/ortEnv.ts 无条件设 wasmPaths 指向本站；这里加上名单，
+  // 防止以后再有人「顺手引一个 CDN」。
+  'cdn.jsdelivr.net',
+  'fastly.jsdelivr.net',
+  'jsdelivr.net',
+  'unpkg.com',
+  'cdnjs.cloudflare.com',
+  'cdn.skypack.dev',
+  'esm.sh',
+  'esm.run',
+  'cdn.tailwindcss.com',
 ];
 
 /** 形似密钥的字符串。宁可误报也不要漏报。 */
@@ -152,6 +169,108 @@ if (hosts.size === 0) {
     console.log(`  ${hostAllowed(host) ? '✓' : '×'} ${host}  (${where})`);
   }
 }
+
+// ── 产物扫描：源码干净不代表产物干净 ──────────────────────────────
+// 上面只扫源码，而依赖包里的字面量要到构建后才进 dist。transformers.js 就是这么
+// 把 cdn.jsdelivr.net 塞进来的 —— 源码里一个字都没有，构建产物里有。
+//
+// 注意：**不能**因为产物里出现 cdn.jsdelivr.net 就报错。那段 URL 是
+// transformers.js 自己的代码，删不掉；我们靠 src/lib/ortEnv.ts 无条件覆写
+// `env.wasm.wasmPaths` 来让它永远不被使用。所以这里改成检查两件真正能证明
+// 「运行时来自本站」的事：
+//   1. dist/ort/ 下四个自托管运行时文件都在（构建插件拷出来的）；
+//   2. dist/assets/ 里没有残留的超大 wasm（那个 26.8MB 的死重应该已被剔除）。
+const DIST_DIR = path.join(ROOT, 'dist');
+const DIST_TEXT_EXT = new Set(['.js', '.mjs', '.cjs', '.css', '.html', '.json', '.webmanifest']);
+const DIST_MAX_WASM = 12 * 1024 * 1024;
+const REQUIRED_DIST_ORT = [
+  'ort-wasm-simd-threaded.asyncify.mjs',
+  'ort-wasm-simd-threaded.asyncify.wasm',
+  'ort-wasm-simd-threaded.mjs',
+  'ort-wasm-simd-threaded.wasm',
+];
+const distNotes = [];
+
+async function scanDist(dir) {
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name === 'models') continue;
+      await scanDist(full);
+      continue;
+    }
+    const rel = path.relative(ROOT, full).replace(/\\/g, '/');
+    const ext = path.extname(entry.name).toLowerCase();
+    if (ext === '.wasm' && rel.startsWith('dist/assets/')) {
+      const info = await stat(full).catch(() => null);
+      if (info && info.size > DIST_MAX_WASM) {
+        problems.push(`${rel}: 产物里残留了 ${(info.size / 1048576).toFixed(1)}MiB 的 wasm（本应剔除，运行时用 dist/ort/ 里的）`);
+      }
+    }
+    if (!DIST_TEXT_EXT.has(ext)) continue;
+    const info = await stat(full).catch(() => null);
+    if (!info || info.size > 8 * 1024 * 1024) continue;
+    const text = await readFile(full, 'utf8');
+    for (const bad of ['cdn.jsdelivr.net', 'fastly.jsdelivr.net', 'unpkg.com', 'cdnjs.cloudflare.com']) {
+      if (text.includes(bad)) distNotes.push(`${rel} 含库内字面量 ${bad}（被 ortEnv 覆写，不生效）`);
+    }
+  }
+  return distNotes;
+}
+
+const distScanned = await scanDist(DIST_DIR);
+if (distScanned === null) {
+  console.log('产物扫描 —— 跳过（没有 dist/，先 pnpm build）');
+} else {
+  const missing = [];
+  for (const name of REQUIRED_DIST_ORT) {
+    const info = await stat(path.join(DIST_DIR, 'ort', name)).catch(() => null);
+    if (!info) missing.push(name);
+  }
+  if (missing.length > 0) {
+    problems.push(`dist/ort/ 缺文件：${missing.join('、')}（运行时会把 ORT 送去第三方 CDN，真机会报 TypeError: Load failed）`);
+  }
+  console.log(`产物扫描 —— 自托管 ORT 运行时：${missing.length === 0 ? '4/4 就位' : `缺 ${missing.length} 个`}`);
+  console.log(`产物扫描 —— 库内 CDN 字面量（不生效，仅记录）：${distNotes.length} 处`);
+  for (const note of distNotes) console.log(`  · ${note}`);
+}
+
+// ── 调用点护栏：引用 transformers.js 的地方必须同时设 wasmPaths ────
+// 这是本次真机翻车的直接原因 —— 探针页 import 了 transformers.js，却没调
+// configureOrtWasm，于是 ORT 走了 jsdelivr。少一处调用就够翻一次车。
+const ORT_PRONE_FILES = [];
+async function findTransformersImporters(dir) {
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue;
+      await findTransformersImporters(full);
+      continue;
+    }
+    if (path.extname(entry.name).toLowerCase() !== '.ts' && path.extname(entry.name).toLowerCase() !== '.tsx') continue;
+    const text = await readFile(full, 'utf8');
+    if (!text.includes('@huggingface/transformers')) continue;
+    const rel = path.relative(ROOT, full).replace(/\\/g, '/');
+    ORT_PRONE_FILES.push(rel);
+    if (!/configureOrtWasm\s*\(/.test(text)) {
+      problems.push(`${rel}: 引用了 @huggingface/transformers 但没调用 configureOrtWasm()，ORT 会被送去 cdn.jsdelivr.net`);
+    }
+  }
+}
+await findTransformersImporters(path.join(ROOT, 'src'));
+console.log(`调用点护栏 —— 引用 transformers.js 的文件：${ORT_PRONE_FILES.length} 个，全部已设 wasmPaths`);
 
 if (problems.length > 0) {
   console.error('\n发现破坏「零成本 / 零第三方」承诺的问题：');
