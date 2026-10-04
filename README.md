@@ -108,7 +108,8 @@ pnpm verify       # 上面三件事一起跑
 | 验证 | `probe.html` + `src/probe/`：M0 探针页，**已就绪、待真机运行** |
 
 构建实测：`pnpm build` 通过（`tsc -b` 无错误，两个入口 `index.html` + `probe.html`）；
-完整产物 **43 个文件 / 186.28 MB**，其中 24 个是自托管模型（159.6 MB），最大的是 26.8 MB 的 ONNX Runtime wasm。
+完整产物 **46 个文件 / 199.96 MB**，其中 24 个是自托管模型（159.6 MB），
+另加 4 个自托管的 ONNX Runtime 运行时文件（`dist/ort/`，两对变体共 41 MB）。
 
 ### 还没做的（也是接下来最该做的）
 
@@ -123,7 +124,8 @@ pnpm verify       # 上面三件事一起跑
 
 ### 四个必须知道的事实
 
-1. **模型自己托管，首访要下 160 MB。** Hugging Face CDN 在国内实测 0/3 不通（DNS 污染 + SNI 阻断），所以 `scripts/fetch-models.mjs` 在**构建期**把 24 个文件拉到 `public/models/` 随站点发布，运行时 `allowRemoteModels=false`，**不访问任何外部服务**。好处是「朋友能不能用」不再取决于他能否连上 HF；代价是站点变成 186 MB，GitHub Pages 的 100 GB/月带宽 ≈ **550 次完整首访/月**，这是现在要盯的指标。复访走 Cache Storage，不再花流量。
-2. **Cloudflare Pages 有 25 MiB 单文件上限，而且现在有 4 个文件超限。** 除了 26.8 MB 的 `ort-wasm-simd-threaded.asyncify.wasm`（这个能外置成本仓库的 Release 资产），还有 3 个模型 `.onnx`（29 / 50 / 57 MB）——**它们没有外置方案**，因为外置就等于回到「运行时从第三方 CDN 取权重」。**所以 GitHub Pages 是唯一无损路线。**
-3. **Chrome 内置翻译 API 不支持手机**（只支持桌面 Chrome 138+ / Edge 148+，且要求 16GB 内存）。所以手机上只能走本地模型或浏览器原生识别 —— 这正是 `docs/03` 设计四层降级链的原因。另外 Chrome 的原生识别在**国内同样不通**（音频要发往 Google 服务器）。
-4. **小模型翻译数字不可靠**（hayamimi 官方 Limitations 原文："numeric values are not reliably preserved"）。本项目的对策是**数字完全绕开翻译模型**，从英文原文按规则抽取并生成对照表。
+1. **模型自己托管，首访要下 160 MB。** Hugging Face CDN 在国内实测 0/3 不通（DNS 污染 + SNI 阻断），所以 `scripts/fetch-models.mjs` 在**构建期**把 24 个文件拉到 `public/models/` 随站点发布，运行时 `allowRemoteModels=false`，**不访问任何外部服务**。好处是「朋友能不能用」不再取决于他能否连上 HF；代价是站点变成 200 MB，GitHub Pages 的 100 GB/月带宽 ≈ **500 次完整首访/月**，这是现在要盯的指标。复访走 Cache Storage，不再花流量。
+2. **ONNX Runtime 的运行时也必须自托管 —— 这一条是真机实测才发现的（提交 `3d40184`）。** transformers.js 的产物里写着：只要 `env.backends.onnx.wasm.wasmPaths` 为空，它就把 ORT 的 `.mjs` 胶水和 26.8 MB 的 wasm 指向一个**第三方静态资源 CDN**。国内手机上那个 CDN 连不上，`pipeline()` 抛 `TypeError: Load failed` —— 看起来像「模型加载失败」，实际是 CDN 不通。现在 `src/lib/ortEnv.ts` 的 `configureOrtWasm()` **无条件**把它指到本站 `/<base>/ort/`，`vite.config.ts` 的 `ortRuntime()` 插件负责把那两对文件拷进产物。**`pnpm lint:cost` 现在会扫产物和调用点，防止这个回归再次发生。**
+3. **Cloudflare Pages 有 25 MiB 单文件上限，而且现在有 4 个文件超限。** 除了 26.8 MB 的 `ort-wasm-simd-threaded.asyncify.wasm`（这个能外置成本仓库的 Release 资产），还有 3 个模型 `.onnx`（29 / 50 / 57 MB）——**它们没有外置方案**，因为外置就等于回到「运行时从第三方 CDN 取权重」。**所以 GitHub Pages 是唯一无损路线。**
+4. **Chrome 内置翻译 API 不支持手机**（只支持桌面 Chrome 138+ / Edge 148+，且要求 16GB 内存）。所以手机上只能走本地模型或浏览器原生识别 —— 这正是 `docs/03` 设计四层降级链的原因。另外 Chrome 的原生识别在**国内同样不通**（音频要发往 Google 服务器）。经真机实测，**手机浏览器一律没有原生识别**，所以这一层在移动端实际上不存在。
+5. **小模型翻译数字不可靠**（hayamimi 官方 Limitations 原文："numeric values are not reliably preserved"）。本项目的对策是**数字完全绕开翻译模型**，从英文原文按规则抽取并生成对照表。
