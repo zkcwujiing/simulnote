@@ -6,6 +6,7 @@ import {
   fmtBytes,
   fmtMs,
   MT_SAMPLES,
+  benchOrtRuntime,
   probeCacheWrite,
   probeDevice,
   probeExtractive,
@@ -241,6 +242,21 @@ export default function ProbeApp() {
       };
     });
 
+  // ── V9 ORT 运行时自取（只下运行时，不碰模型）─────────────
+  const runOrtRuntime = () =>
+    run('V9', 'ORT 运行时自取', async () => {
+      log('只取 ORT 运行时，不下载任何模型 —— 成不成几十秒就能看出来。');
+      const r = await benchOrtRuntime((note) => log(note));
+      log(`ORT 运行时结论：${r.state}`);
+      return {
+        id: r.id,
+        title: r.title,
+        state: r.state,
+        verdict: r.verdict,
+        details: r.details,
+      };
+    });
+
   // ── V6 抽取式摘要 ───────────────────────────────────────
   const runExtractive = () =>
     run('V6', '抽取式摘要自检', async () => {
@@ -440,7 +456,17 @@ export default function ProbeApp() {
         </Section>
 
         <Section
-          title="② V8 · 内存压力测试（最关键的一个数字）"
+          title="② V9 · ORT 运行时自取（只下运行时，不碰模型）"
+          hint="约 27 MB、几十秒。它失败的话 V2/V4 一定失败，不用再白下 160 MB 模型。"
+        >
+          <button className={BTN_DANGER} disabled={busy !== null} onClick={() => void runOrtRuntime()}>
+            {busy === 'V9' ? '运行中…' : '先跑这个'}
+          </button>
+          {results.V9 && <ResultCard r={results.V9} />}
+        </Section>
+
+        <Section
+          title="③ V8 · 内存压力测试（最关键的一个数字）"
           hint="决定手机端到底能跑几个模型：拿到的内存越多，能做的档位越高。"
         >
           <button className={BTN_DANGER} disabled={busy !== null} onClick={() => void runMemory()}>
@@ -449,7 +475,7 @@ export default function ProbeApp() {
           {results.V8 && <ResultCard r={results.V8} />}
         </Section>
 
-        <Section title="③ V6 · 抽取式摘要自检" hint="纯 JS，零下载。它跑不通就说明兜底防线失效。">
+        <Section title="④ V6 · 抽取式摘要自检" hint="纯 JS，零下载。它跑不通就说明兜底防线失效。">
           <button className={BTN_GHOST} disabled={busy !== null} onClick={() => void runExtractive()}>
             {busy === 'V6' ? '运行中…' : '开始'}
           </button>

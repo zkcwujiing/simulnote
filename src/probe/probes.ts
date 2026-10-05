@@ -114,6 +114,85 @@ export function describeWasmPaths(value: string | Record<string, string> | null)
   return `${host} → ${mjs.split('/').pop()} + ${wasm.split('/').pop()}`;
 }
 
+export interface OrtRuntimeProbeResult {
+  id: string;
+  title: string;
+  state: 'pass' | 'warn' | 'fail';
+  verdict: string;
+  details: Record<string, string | number | boolean | null>;
+}
+
+/**
+ * V9：**只取 ORT 运行时**，不碰任何模型。
+ *
+ * 存在的理由：V2/V4 要先下 160 MB 模型才能开始跑，而「运行时代码没跑起来」
+ * 这件事跟模型一点关系都没有。上一次用户就是这样白下了 160 MB，
+ * 最后拿到的只有一句 `Aborted(both async and sync fetching of the wasm failed)`。
+ * 这个探针把那一层单独拎出来：27 MB、几十秒，成不成一目了然。
+ *
+ * 它做的验证比 ORT 自己做的还多一步：把下好的字节交给 `WebAssembly.compile()`，
+ * 于是「长度对但内容是坏的」这类问题也当场暴露。
+ */
+export async function benchOrtRuntime(
+  onNote?: (msg: string) => void,
+): Promise<OrtRuntimeProbeResult> {
+  resetFetchLog();
+  onNote?.('正在取 ORT 运行时（异步 webassembly 那套，约 27 MB），不下载任何模型…');
+  const t0 = performance.now();
+  let error: string | null = null;
+  let paths: string | Record<string, string> | null = null;
+  let compiled = false;
+  let compileMs: number | null = null;
+  try {
+    // 传一个够用的空壳 env：configureOrtWasm 只认 backends.onnx.wasm 这一点。
+    paths = await configureOrtWasm({ backends: { onnx: { wasm: {} } } });
+    const active = activeOrtRuntime();
+    if (active) {
+      onNote?.(`取到了：${active.stem} · ${active.note}，现在真编译一次…`);
+      const wasmUrl = (paths as Record<string, string>).wasm;
+      const c0 = performance.now();
+      const bytes = await (await fetch(wasmUrl)).arrayBuffer();
+      await WebAssembly.compile(bytes);
+      compileMs = Math.round(performance.now() - c0);
+      compiled = true;
+    }
+  } catch (err) {
+    error = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+  }
+  const ms = Math.round(performance.now() - t0);
+  const active = activeOrtRuntime();
+  const mbps = active && active.ms > 0 ? active.bytes / 1048576 / (active.ms / 1000) : null;
+
+  return {
+    id: 'V9',
+    title: 'ORT 运行时自取（只下运行时，不碰模型）',
+    state: error ? 'fail' : compiled ? 'pass' : 'warn',
+    verdict: error
+      ? `取运行时这一步就失败了：「${error}」。**V2/V4 现在必定跑不起来，不必再试** —— 把这份报告发出来。`
+      : compiled
+        ? `运行时 $(1) 取到并能编译，用时 ${(ms / 1000).toFixed(1)} 秒${mbps ? `（${mbps.toFixed(2)} MB/s）` : ''}。这条路通了，V2/V4 的失败原因就不在运行时上。`.replace(
+            '$(1)',
+            active?.stem ?? '',
+          )
+        : '运行时取到了但没来得及验证（没有记录到生效的运行时），把报告发出来。',
+    details: {
+      结果: error ? '失败' : compiled ? '通过' : '未完成',
+      变体: active?.stem ?? '—',
+      来源: active?.source ?? '—',
+      字节数: active ? `${(active.bytes / 1048576).toFixed(1)} MB` : '—',
+      '下载耗时（ms）': active?.ms ?? '—',
+      '平均速度': mbps ? `${mbps.toFixed(2)} MB/s` : '—',
+      '是否本机缓存': active?.cached ?? '—',
+      'WebAssembly.compile 成功': compiled,
+      '编译耗时（ms）': compileMs ?? '—',
+      '写入 env 的 wasmPaths': describeWasmPaths(paths),
+      '错误': error ?? '无',
+      '库发出的网络请求（最近 8 条）': fetchLogText(8),
+      '总耗时（ms）': ms,
+    },
+  };
+}
+
 export interface ProbeResult {
   id: string;
   title: string;
@@ -660,6 +739,9 @@ export async function benchWhisper(opts: WhisperBenchOptions): Promise<ModelTimi
     opts.onNote?.(`模块加载完成（${Math.round(performance.now() - t0)} ms）`);
 
     configureModelSource(env);
+    // 先清日志再取运行时 —— 反过来的话，ORT 自己那几条下载记录会被这次清空抹掉，
+    // 而它们正是「运行时到底从哪儿来」的唯一证据。
+    resetFetchLog();
     const wasmPaths = await configureOrtWasm(env);
     opts.onNote?.(
       `模型来源：本站 ${String((env as { localModelPath?: string }).localModelPath ?? '')}；` +
@@ -760,10 +842,11 @@ export async function benchMt(opts: {
     opts.onNote?.('动态导入 @huggingface/transformers …');
     const { pipeline, env } = await import('@huggingface/transformers');
     configureModelSource(env);
+    // 同 benchWhisper：先清日志再取运行时，别把 ORT 的下载记录抹掉。
+    resetFetchLog();
     const wasmPaths = await configureOrtWasm(env);
     opts.onNote?.(`ORT 运行时：${describeWasmPaths(wasmPaths)}`);
     result.ortRuntime = describeWasmPaths(wasmPaths);
-    resetFetchLog();
     // 探针的职责就是「现在测一次」，所以不沿用 localStorage 里上次的测速结论。
     // 否则报告上只会写「1 小时内沿用上次的测速结果」，看不出两个源此刻的真实状态。
     forgetSource();
