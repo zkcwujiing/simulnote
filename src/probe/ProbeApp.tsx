@@ -349,6 +349,8 @@ export default function ProbeApp() {
           '吞吐（句/秒）': r.throughputPerSec ?? '—',
           '单句耗时（ms）': r.perSentenceMs.join(', ') || '—',
           'ORT 运行时来源': r.ortRuntime ?? '—',
+          '裸取诊断（绕开库直取编码器）': r.rawProbe ?? '（没跑，说明加载成功）',
+          '库发出的网络请求（最近 8 条）': r.fetchLog ?? '—',
           '产物样例（空字符串通常意味着需要用带语言前缀的模型）': r.outputs[0] ?? '—',
         },
         samples: pairs,

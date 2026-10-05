@@ -13,8 +13,78 @@
  * 测别的 id 会立刻报 `ModelFileNotFoundError`，那不是坏了，是本站没托管它。
  */
 
-import { configureModelSource } from '@/lib/modelSource';
+import { configureModelSource, fetchLogText, localModelPath, resetFetchLog } from '@/lib/modelSource';
 import { configureOrtWasm } from '@/lib/ortEnv';
+
+/**
+ * 裸取一个文件，**绕开 transformers.js 和 ORT**，只走浏览器原生 `fetch`。
+ *
+ * 用途：当模型加载失败时，用它把「网络到底能不能把这个文件拿下来」
+ * 和「transformers.js / ORT 会不会用它」这两件事分开。
+ * 失败时报告**已经收到多少字节**——这是判断「是不是撞上了某个体积/时长阈值」的唯一线索。
+ */
+export async function probeRawDownload(
+  url: string,
+  onProgress?: (receivedMb: number) => void,
+): Promise<{ ok: boolean; status: number | null; bytes: number; ms: number; error: string | null }> {
+  const startedAt = Date.now();
+  let received = 0;
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: response.status,
+        bytes: 0,
+        ms: Date.now() - startedAt,
+        error: `HTTP ${response.status}`,
+      };
+    }
+    const body = response.body;
+    if (!body) {
+      const buf = await response.arrayBuffer();
+      received = buf.byteLength;
+    } else {
+      const reader = body.getReader();
+      let lastReport = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        received += value?.byteLength ?? 0;
+        const mb = Math.floor(received / 1048576);
+        if (mb > lastReport) {
+          lastReport = mb;
+          onProgress?.(mb);
+        }
+      }
+    }
+    return {
+      ok: true,
+      status: response.status,
+      bytes: received,
+      ms: Date.now() - startedAt,
+      error: null,
+    };
+  } catch (err) {
+    const e = err as { name?: string; message?: string };
+    return {
+      ok: false,
+      status: null,
+      bytes: received,
+      ms: Date.now() - startedAt,
+      error: `${e?.name ?? 'Error'}: ${e?.message ?? String(err)}`,
+    };
+  }
+}
+
+/** 把裸取结果说成一行中文。 */
+export function describeRawDownload(
+  r: { ok: boolean; bytes: number; ms: number; error: string | null },
+): string {
+  const mb = (r.bytes / 1048576).toFixed(1);
+  if (r.ok) return `裸取成功：${mb} MB / ${r.ms} ms（网络没问题，问题在 transformers.js 或 ORT）`;
+  return `裸取失败：只收到 ${mb} MB 就断了 · ${r.error ?? '未知错误'}`;
+}
 
 export type ProbeState = 'idle' | 'running' | 'pass' | 'warn' | 'fail' | 'skip';
 
@@ -653,6 +723,10 @@ export interface MtBenchResult {
   outputs: string[];
   /** ORT 运行时实际从哪儿取（人话）。 */
   ortRuntime: string | null;
+  /** 失败时的裸取诊断结论：网络能不能拿到文件。 */
+  rawProbe: string | null;
+  /** 失败时 transformers.js 真正发过的网络请求（含失败的那一条）。 */
+  fetchLog: string | null;
   error?: string;
 }
 
@@ -673,6 +747,8 @@ export async function benchMt(opts: {
     throughputPerSec: null,
     outputs: [],
     ortRuntime: null,
+    rawProbe: null,
+    fetchLog: null,
   };
   try {
     opts.onNote?.('动态导入 @huggingface/transformers …');
@@ -681,6 +757,7 @@ export async function benchMt(opts: {
     const wasmPaths = configureOrtWasm(env);
     opts.onNote?.(`ORT 运行时：${describeWasmPaths(wasmPaths)}`);
     result.ortRuntime = describeWasmPaths(wasmPaths);
+    resetFetchLog();
 
     const loadStart = performance.now();
     const translator = await pipeline('translation', opts.modelId, {
@@ -720,6 +797,19 @@ export async function benchMt(opts: {
     return result;
   } catch (err) {
     result.error = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    result.fetchLog = fetchLogText();
+    // 诊断：绕开 transformers.js 和 ORT，用浏览器原生 fetch 直接取一次编码器文件。
+    // 「裸取能成」= 网络没问题，锅在库；「裸取也断」= 网络 / 体积阈值问题。
+    // 只在失败时才跑，成功了不额外花用户流量。
+    try {
+      opts.onNote?.('加载失败 —— 正在做裸取诊断（绕开库，直接 fetch 编码器文件）…');
+      const url = `${localModelPath()}${opts.modelId}/onnx/encoder_model_quantized.onnx`;
+      const raw = await probeRawDownload(url, (mb) => opts.onNote?.(`裸取已收到 ${mb} MB …`));
+      result.rawProbe = describeRawDownload(raw);
+      opts.onNote?.(result.rawProbe);
+    } catch (probeErr) {
+      result.rawProbe = `裸取诊断本身出错：${String(probeErr)}`;
+    }
     return result;
   }
 }

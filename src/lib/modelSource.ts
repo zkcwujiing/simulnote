@@ -28,10 +28,53 @@ interface TransformersEnvLike {
   allowRemoteModels?: boolean;
   useBrowserCache?: boolean;
   localModelPath?: string;
+  fetch?: (input: string | URL, init?: RequestInit) => Promise<Response>;
 }
 
 /** 站点里存放模型的目录名（相对站点根）。与 scripts/fetch-models.mjs 的输出目录一致。 */
 const MODEL_DIR = 'models';
+
+/**
+ * 抓取日志 —— 每一条 transformers.js 发出的真实网络请求。
+ *
+ * 为什么需要它：真机上出现过 `TypeError: Load failed`，而那句话**不告诉你是谁失败了**。
+ * 报告里只能看到「模型加载失败」，于是排查方向被误导到模型文件、跨域、路径上去，
+ * 实际却是运行时被送到了第三方 CDN。有了这份日志，失败的那一条 URL 会直接印在报告里。
+ *
+ * 记录上限 200 条，只保留最近 8 条用于展示。
+ */
+export interface FetchRecord {
+  url: string;
+  status: number | null;
+  ok: boolean;
+  bytes: number | null;
+  ms: number;
+  error: string | null;
+}
+
+const FETCH_LOG_LIMIT = 200;
+let fetchLog: FetchRecord[] = [];
+
+export function resetFetchLog(): void {
+  fetchLog = [];
+}
+
+export function fetchLogTail(n = 8): FetchRecord[] {
+  return fetchLog.slice(-n);
+}
+
+/** 把最近几条请求压成一段可读文本，直接塞进报告。 */
+export function fetchLogText(n = 8): string {
+  const tail = fetchLogTail(n);
+  if (tail.length === 0) return '（这次没有任何网络请求）';
+  return tail
+    .map((r) => {
+      const size = r.bytes === null ? '?' : `${(r.bytes / 1048576).toFixed(1)}MB`;
+      const head = r.error ? `✗ ${r.error}` : `${r.status} ${r.ok ? 'ok' : 'bad'} ${size}`;
+      return `${head}  ${r.ms}ms  ${r.url}`;
+    })
+    .join('\n');
+}
 
 /** 站点根路径，带结尾斜杠。Vite 注入的 BASE_URL 已经保证了这一点，这里只做兜底。 */
 export function siteBase(): string {
@@ -57,4 +100,61 @@ export function configureModelSource(env: unknown): void {
   // 而且手机从后台切回来时不会因为重新解析 40MB 的 onnx 而卡住。
   target.useBrowserCache = true;
   target.localModelPath = localModelPath();
+  instrumentFetch(target);
+}
+
+/** 已经被包过一次的 env 打个标记，避免重复包装（包装层会叠加计时）。 */
+const WRAPPED = Symbol.for('simulnote.fetchWrapped');
+
+/**
+ * 把 `env.fetch` 换成一个记账版本。
+ *
+ * 失败时**原样抛出**原来的错误 —— 我们只想记录，不想改变 transformers.js 的错误处理。
+ * 这份日志由探针页读出来写进报告。
+ */
+export function instrumentFetch(env: unknown): void {
+  const target = env as TransformersEnvLike & { [WRAPPED]?: boolean };
+  if (target[WRAPPED]) return;
+  const original =
+    target.fetch ??
+    (typeof globalThis.fetch === 'function' ? globalThis.fetch.bind(globalThis) : null);
+  if (!original) return;
+
+  target.fetch = async (input: string | URL, init?: RequestInit): Promise<Response> => {
+    const href = typeof input === 'string' ? input : String(input);
+    const startedAt = Date.now();
+    try {
+      const response = await original(input, init);
+      const declared = Number(response.headers.get('content-length'));
+      fetchLog.push({
+        url: href,
+        status: response.status,
+        ok: response.ok,
+        bytes: Number.isFinite(declared) ? declared : null,
+        ms: Date.now() - startedAt,
+        error: null,
+      });
+      trimLog();
+      return response;
+    } catch (err) {
+      const e = err as { name?: string; message?: string };
+      fetchLog.push({
+        url: href,
+        status: null,
+        ok: false,
+        bytes: null,
+        ms: Date.now() - startedAt,
+        error: `${e?.name ?? 'Error'}: ${e?.message ?? String(err)}`,
+      });
+      trimLog();
+      throw err;
+    }
+  };
+  target[WRAPPED] = true;
+}
+
+function trimLog(): void {
+  if (fetchLog.length > FETCH_LOG_LIMIT) {
+    fetchLog = fetchLog.slice(-FETCH_LOG_LIMIT);
+  }
 }
