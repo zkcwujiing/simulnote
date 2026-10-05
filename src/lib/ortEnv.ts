@@ -141,8 +141,20 @@ const ORT_CACHE = 'simulnote-ort-v1';
 /** 分块下载参数，与 `lib/modelSource.ts` 里 `.onnx` 那套同源同思路。 */
 const CHUNK_BYTES = 2 * 1024 * 1024;
 const MIN_CHUNK_BYTES = 512 * 1024;
-const MAX_ATTEMPTS = 4;
+const MAX_ATTEMPTS = 6;
 const WASM_TIMEOUT_MS = 30000;
+
+/**
+ * 单块的超时。
+ *
+ * **不能是固定值** —— 实测自建源只有 27~39 KB/s，2 MB 一块要 60 秒以上，
+ * 固定 30 秒会把「慢但能用的源」判死（离线复刻时自建那条就死在 21 MB 处）。
+ * 折成「底 30 秒 + 按 25 KB/s 折算」，于是块缩小之后超时也跟着缩短：
+ * 2 MB → 82 秒，512 KB → 43 秒。
+ */
+function timeoutForChunk(bytes: number): number {
+  return WASM_TIMEOUT_MS + Math.round(bytes / 40);
+}
 
 /**
  * 首选哪一套运行时。
@@ -227,7 +239,7 @@ async function fetchRangeOnce(
   end: number,
 ): Promise<{ buf: ArrayBuffer; total: number | null; whole: boolean }> {
   const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), WASM_TIMEOUT_MS);
+  const timer = setTimeout(() => ctl.abort(), timeoutForChunk(end - start + 1));
   try {
     const res = await fetch(url, {
       headers: { Range: `bytes=${start}-${end}` },
