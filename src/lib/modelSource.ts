@@ -157,8 +157,15 @@ const PROBE_BYTES = 256 * 1024;
 const PROBE_REL = 'Xenova/whisper-tiny.en/onnx/encoder_model_quantized.onnx';
 /** 单个源测速的超时。自建在弱网下 256 KB 也就 3 秒左右，20 秒足够。 */
 const PROBE_TIMEOUT_MS = 20000;
-/** 记住上次的选择，1 小时内不重复测速。 */
-const SOURCE_KEY = 'simulnote.modelSource';
+/**
+ * 记住上次的选择，1 小时内不重复测速。
+ *
+ * **改源列表时必须改这个键名。** 老的值里可能存着 `自建` —— 那是上一版
+ * 只有两个源时测出来的结论，在新的一版里它依然能按 label 命中，
+ * 于是用户在接下来的一小时里会**继续用最慢的那个源**，
+ * 看起来就像「修复没生效」。加 `.v2` 就是为了让旧结论自动作废。
+ */
+const SOURCE_KEY = 'simulnote.modelSource.v2';
 const SOURCE_TTL_MS = 60 * 60 * 1000;
 
 /** 本次会话实际选用的源，供探针页展示。 */
