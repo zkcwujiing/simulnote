@@ -232,12 +232,12 @@ async function writeOrtCache(key: string, buf: ArrayBuffer): Promise<void> {
   }
 }
 
-/** 取一段，返回这一段以及从 `Content-Range` 解出的总长度。 */
+/** 取一段。`whole` 表示服务端没理 Range，把整份发回来了。 */
 async function fetchRangeOnce(
   url: string,
   start: number,
   end: number,
-): Promise<{ buf: ArrayBuffer; total: number | null; whole: boolean }> {
+): Promise<{ buf: ArrayBuffer; whole: boolean }> {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeoutForChunk(end - start + 1));
   try {
@@ -248,8 +248,7 @@ async function fetchRangeOnce(
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const buf = await res.arrayBuffer();
-    const total = Number(/\/(\d+)\s*$/.exec(res.headers.get('content-range') ?? '')?.[1] ?? NaN);
-    return { buf, total: Number.isFinite(total) ? total : null, whole: res.status === 200 };
+    return { buf, whole: res.status === 200 };
   } finally {
     clearTimeout(timer);
   }
@@ -261,23 +260,25 @@ async function fetchRangeOnce(
  * 为什么不交给 ORT 自己 fetch：**单次长响应在手机上必断**（R17 就是这么来的）。
  * 26.8 MB 一次拉完在国内链路上是很高的失败率，分块之后断的只是那一块，
  * 重试代价从「整份重来」变成「重来 2 MB」。顺带还能核对总长度。
+ *
+ * **循环边界用 `want`（我们已知的文件长度），不看响应头。** npmmirror 会忽略
+ * Range 把整份发回来（200），自建源同域什么头都读得到；但第三方镜像**可能既
+ * 不回 200、也不暴露 `Content-Range`**（ModelScope 就是这样，详见
+ * `modelSource.ts` 里 `expectedModelBytes` 的注释）——那时按响应头判断终点
+ * 就会变成没有出口的循环。长度本来就已知，用它最稳，顺带也不会去要文件末尾
+ * 之外的数据。
  */
 async function downloadWasm(url: string, want: number): Promise<ArrayBuffer> {
   const parts: ArrayBuffer[] = [];
   let start = 0;
-  let total: number | null = null;
   let chunk = CHUNK_BYTES;
   let attempts = 0;
-  while (total === null || start < total) {
-    const end = start + chunk - 1;
+  while (start < want) {
+    const end = Math.min(start + chunk, want) - 1;
     try {
       const got = await fetchRangeOnce(url, start, end);
       if (got.buf.byteLength === 0) throw new Error('收到 0 字节');
       parts.push(got.buf);
-      if (got.total !== null) total = got.total;
-      if (got.whole) {
-        total = got.buf.byteLength;
-      }
       start += got.buf.byteLength;
       attempts = 0;
       // 连着几块都顺，就把块涨回去 —— 不能只降不升（R18 的教训）。

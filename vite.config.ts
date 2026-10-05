@@ -2,7 +2,7 @@ import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import { fileURLToPath, URL } from 'node:url';
-import { copyFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 // GitHub Pages 的项目站点部署在 /<仓库名>/ 子路径下，Cloudflare Pages 部署在根路径。
@@ -127,10 +127,42 @@ function ortVersion(): string {
   return JSON.parse(readFileSync(pkg, 'utf8')).version as string;
 }
 
+/**
+ * 模型清单：相对路径 → 字节数，注入成 `__MODEL_SIZES__`。
+ *
+ * **为什么要有它（这一段是踩坑记录）：** `lib/modelSource.ts` 的分块下载靠
+ * 「服务端告诉我文件有多大」来决定什么时候停 —— 它读 `Content-Range`。自建源是本域，
+ * 什么头都读得到；hf-mirror 老老实实发了 `Access-Control-Expose-Headers: Content-Range`。
+ * 但 **ModelScope 不发 `Access-Control-Expose-Headers`**（实测 2026/10/5，
+ * `access-control-expose-headers: （没有）`），于是浏览器里
+ * `res.headers.get('content-range')` 恒为 `null`，总长永远是未知 →
+ * `while (total === null || offset < total)` 变成**没有出口的循环**：
+ * 它会一直往文件末尾之外要数据，直到服务端回 416 才失败，然后换源从头再下一遍。
+ * 这就是 V2「能过但很慢」、V4（117 MB）「跑了很久还没有报告」的原因。
+ *
+ * 长度本来就是**已知**的 —— 这些文件是我们自己随站点发的。构建时扫一遍写进包里，
+ * 下载器就有了一份不依赖任何响应头的真值，顺带还能算出进度百分比。
+ */
+function modelSizes(): Record<string, number> {
+  const root = fileURLToPath(new URL('./public/models/', import.meta.url));
+  const out: Record<string, number> = {};
+  if (!existsSync(root)) return out;
+  const walk = (dir: string, prefix: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) walk(full, `${prefix}${entry.name}/`);
+      else out[`${prefix}${entry.name}`] = statSync(full).size;
+    }
+  };
+  walk(root, '');
+  return out;
+}
+
 export default defineConfig({
   base,
   define: {
     __ORT_VERSION__: JSON.stringify(ortVersion()),
+    __MODEL_SIZES__: JSON.stringify(modelSizes()),
   },
   plugins: [react(), tailwindcss(), ortWasmPolicy(), ortRuntime(), socialMeta()],
   resolve: {

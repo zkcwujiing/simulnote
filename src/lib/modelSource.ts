@@ -472,14 +472,49 @@ const LEGACY_CACHE_NAME = 'transformers-cache';
 const ONNX_RE = /\.onnx(\?|$)/i;
 /** 每块 2 MB。实测 4.5 MB 就会断，留足余量。 */
 const CHUNK_BYTES = 2 * 1024 * 1024;
-/** 减半的下限，再小就只是白白增加往返。 */
-const MIN_CHUNK_BYTES = 512 * 1024;
-/** 同一块最多重试几次，超过就把整次下载判失败。 */
+/**
+ * 同一个文件同时开几路。
+ *
+ * 实测（2026/10/5，ModelScope，同一台机器同一分钟）：串行 8 MB = 7.37 MB/s，
+ * 4 路并发 = 16.13 MB/s，8 路并发 = 27.92 MB/s。**CDN 是按连接限速的**，
+ * 并发是这里最有效的一招。浏览器对同域默认最多开 6 条连接，取 4 既不撞上限、
+ * 又能拿到两倍带宽；手机上再保守一点也是稳赚。
+ */
+const LANES = 4;
+/** 同一块最多重试几次，超过才认为这个源这一块拿不到（然后换源续传）。 */
 const MAX_ATTEMPTS = 5;
+/**
+ * 单块请求的超时基准，实际值按块大小折算。
+ *
+ * **不能是固定值**：自建源只有 27~39 KB/s，2 MB 要 60 秒以上，固定 30 秒
+ * 会把「慢但能用」的最后一个兜底源直接判死（R20 的教训）。
+ */
+const CHUNK_TIMEOUT_MS = 30000;
 /** 我们往缓存条目上贴的「这个文件应该有多少字节」。 */
 const BYTES_HEADER = 'x-simulnote-bytes';
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/** 构建时注入的模型清单：相对路径 → 字节数（见 vite.config.ts 的 `modelSizes()`）。 */
+declare const __MODEL_SIZES__: Record<string, number>;
+
+/**
+ * 这个文件应该有多少字节；清单里没有就返回 null。
+ *
+ * **不再读 `Content-Range` 了。** 自建源同域、什么头都读得到，hf-mirror 也老实发了
+ * `Access-Control-Expose-Headers: Content-Range`，但 **ModelScope 不发**
+ * （2026/10/5 实测 `access-control-expose-headers: （没有）`）—— 跨域下浏览器里
+ * `res.headers.get('content-range')` 恒为 `null`，分块循环因此**失去终点**：
+ * 它会一直往文件末尾之外要数据，直到服务端回 416 才失败，然后换源从头再下一遍。
+ * 这就是「V2 能过但很慢」「V4 跑了很久还没有报告」的真正原因。
+ *
+ * 长度本来就是已知的 —— 这些文件是我们自己随站点发的。构建时扫一遍写进包，
+ * 下载器就有了一份不依赖任何响应头的真值，顺带还能算出进度。
+ */
+export function expectedModelBytes(rel: string): number | null {
+  const n = __MODEL_SIZES__?.[rel];
+  return typeof n === 'number' && n > 0 ? n : null;
+}
 
 async function openModelCache(): Promise<Cache | null> {
   try {
@@ -523,87 +558,155 @@ function responseFromBlob(blob: Blob): Response {
 
 interface RangeChunk {
   blob: Blob;
-  /** 文件真实总长度，来自 `Content-Range`。服务端忽略了 Range 时为 null。 */
-  total: number | null;
   /** true 表示服务端没理 Range，把整份文件发回来了。 */
   whole: boolean;
 }
 
-async function fetchRangeOnce(url: string, start: number, end: number): Promise<RangeChunk> {
-  const res = await fetch(url, {
-    headers: { Range: `bytes=${start}-${end}` },
-    cache: 'no-store',
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
-  const whole = res.status === 200;
-  let total: number | null = null;
-  const contentRange = res.headers.get('content-range');
-  if (contentRange) {
-    const m = /\/(\d+)\s*$/.exec(contentRange);
-    if (m) total = Number(m[1]);
+/**
+ * 取一个字节区间。**一次请求，不重试** —— 重试的逻辑在 `fetchChunk()` 里。
+ *
+ * `whole: true` 表示服务端没理 `Range`，把整份文件发回来了（200）。
+ */
+async function fetchChunkOnce(url: string, start: number, end: number): Promise<RangeChunk> {
+  const ctl = new AbortController();
+  const want = end - start + 1;
+  // 超时按块大小折算（见 CHUNK_TIMEOUT_MS 的注释），别用固定值。
+  const timer = setTimeout(() => ctl.abort(), CHUNK_TIMEOUT_MS + Math.round(want / 40));
+  try {
+    const res = await fetch(url, {
+      headers: { Range: `bytes=${start}-${end}` },
+      cache: 'no-store',
+      signal: ctl.signal,
+    });
+    if (res.status !== 206 && res.status !== 200) {
+      throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    }
+    return { blob: await res.blob(), whole: res.status === 200 };
+  } finally {
+    clearTimeout(timer);
   }
-  const blob = await res.blob();
-  if (total === null) {
-    // 206 却没有 Content-Range 时只能按累计字节数收尾；200 时整份就是总数。
-    total = whole ? blob.size : null;
+}
+
+/** 同一块重试若干次；这一块在当前源上反复失败就抛出去，交给上层换源续传。 */
+async function fetchChunk(url: string, start: number, end: number): Promise<RangeChunk> {
+  const want = end - start + 1;
+  let last: unknown = new Error('未开始');
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const got = await fetchChunkOnce(url, start, end);
+      if (got.whole) return got; // 服务端整份发回，长度由调用方核对
+      if (got.blob.size !== want) {
+        throw new Error(`这一块收到 ${got.blob.size} 字节，应为 ${want}`);
+      }
+      return got;
+    } catch (err) {
+      last = err;
+      if (attempt < MAX_ATTEMPTS) await sleep(250 * attempt);
+    }
   }
-  return { blob, total, whole };
+  throw last;
+}
+
+/** 首选源排第一，其余按固有优先级跟在后面（分块下载按这个顺序换源续传）。 */
+function sourceOrder(first: ModelSource): ModelSource[] {
+  return [first, ...allSources().filter((s) => s.label !== first.label)];
 }
 
 /**
- * 用 `Range` 把一个大文件分块取回来并拼成一个 Blob。
- * 中途任何一块失败都只重下那一块；连续失败就把块体积减半再试。
+ * 把一个大文件分块取回来并拼成 Blob。**多路并发 + 换源续传**。
+ *
+ * 三条设计，每一条都对应一次真机翻车：
+ *
+ * 1. **总长度问自己，不问服务端。** 来自构建时的模型清单（`expectedModelBytes`）。
+ *    ModelScope 不发 `Access-Control-Expose-Headers`，跨域下读不到 `Content-Range`，
+ *    老代码的 `while (total === null || offset < total)` 因此**没有出口**：
+ *    它会一直往文件末尾之外要数据，直到 416 失败，再换源整份重下。
+ * 2. **4 路并发。** CDN 按连接限速，实测串行 7.37 MB/s / 4 路 16.13 / 8 路 27.92。
+ * 3. **换源续传。** 一块反复失败只说明**这个源**这一块拿不到，已经下好的块留在
+ *    `parts` 里，换个源只补缺的那些。原先是整份重来 —— 117 MB 的 V4 拖到几十分钟
+ *    就是这么来的。
  */
-async function rangeDownload(url: string, onNote?: (note: string) => void): Promise<Blob> {
-  const parts: BlobPart[] = [];
-  let chunk = CHUNK_BYTES;
-  let offset = 0;
-  let total: number | null = null;
-  let failures = 0;
-  /** 连续成功的块数，用来把因失败缩小的块重新涨回去。 */
-  let okStreak = 0;
+async function rangeDownload(
+  sources: ModelSource[],
+  rel: string,
+  totalBytes: number,
+  onNote?: (note: string) => void,
+): Promise<{ blob: Blob; source: ModelSource; ms: number }> {
+  const startedAt = Date.now();
+  const count = Math.max(1, Math.ceil(totalBytes / CHUNK_BYTES));
+  const parts: (Blob | null)[] = new Array<Blob | null>(count).fill(null);
+  let doneBytes = 0;
+  let lastError: unknown = new Error('没有可用的源');
+  const report = (): void =>
+    onNote?.(
+      `已下载 ${(doneBytes / 1048576).toFixed(1)} / ${(totalBytes / 1048576).toFixed(1)} MB`,
+    );
 
-  while (total === null || offset < total) {
-    try {
-      const got = await fetchRangeOnce(url, offset, offset + chunk - 1);
-      if (got.blob.size === 0) throw new Error('这一块收到 0 字节');
-      parts.push(got.blob);
-      offset += got.blob.size;
-      if (got.total !== null) total = got.total;
-      failures = 0;
-      if (got.whole) break;
-      failures = 0;
-      // 失败过的块会减半，但**不能一直小下去**：实测 hf-mirror 取 53 MB 时出现过
-      // 32 次重试，如果块停在 512 KB，剩下的文件要多发几十个请求、每个都带一次往返，
-      // 总时长被拖到 305 秒（平均只有 0.165 MB/s）。连续成功 4 块就翻倍涨回去。
-      okStreak += 1;
-      if (okStreak >= 4 && chunk < CHUNK_BYTES) {
-        chunk = Math.min(CHUNK_BYTES, chunk * 2);
-        okStreak = 0;
-        onNote?.(`连续成功，块大小升回 ${(chunk / 1048576).toFixed(1)} MB`);
+  for (const src of sources) {
+    const url = sourceUrl(src, rel);
+    let next = 0;
+    let stop = false;
+    let wholeFile: Blob | null = null;
+
+    /** 原子地认领下一块。JS 单线程，`next += 1` 不会被两个 lane 撞上。 */
+    const claim = (): number | null => {
+      while (next < count && parts[next] !== null) next += 1;
+      if (next >= count) return null;
+      const i = next;
+      next += 1;
+      return i;
+    };
+
+    const lane = async (): Promise<void> => {
+      for (;;) {
+        if (stop) return;
+        const i = claim();
+        if (i === null) return;
+        const start = i * CHUNK_BYTES;
+        const end = Math.min(start + CHUNK_BYTES, totalBytes) - 1;
+        try {
+          const got = await fetchChunk(url, start, end);
+          if (got.whole) {
+            wholeFile = got.blob;
+            stop = true;
+            return;
+          }
+          parts[i] = got.blob;
+          doneBytes += got.blob.size;
+          report();
+        } catch (err) {
+          // 这一块在这个源上真的拿不到：停掉其它 lane，换源续传。
+          lastError = err;
+          stop = true;
+          return;
+        }
       }
-      const done = (offset / 1048576).toFixed(1);
-      const all = total === null ? '?' : (total / 1048576).toFixed(1);
-      onNote?.(`分块下载 ${done} / ${all} MB`);
-    } catch (err) {
-      failures += 1;
-      okStreak = 0;
-      if (failures >= MAX_ATTEMPTS) throw err;
-      if (chunk > MIN_CHUNK_BYTES) {
-        chunk = Math.max(MIN_CHUNK_BYTES, Math.floor(chunk / 2));
-        onNote?.(`分块中断，块大小降到 ${(chunk / 1048576).toFixed(1)} MB 重试`);
-      } else {
-        onNote?.(`分块中断，第 ${failures + 1} / ${MAX_ATTEMPTS} 次重试`);
+    };
+
+    await Promise.all(Array.from({ length: LANES }, lane));
+
+    if (wholeFile !== null) {
+      const whole: Blob = wholeFile;
+      if (whole.size !== totalBytes) {
+        throw new Error(`整取长度不对：${whole.size} / ${totalBytes}`);
       }
-      await sleep(300 * failures);
+      return { blob: whole, source: src, ms: Date.now() - startedAt };
     }
+    if (parts.every((p) => p !== null)) {
+      return { blob: new Blob(parts as BlobPart[]), source: src, ms: Date.now() - startedAt };
+    }
+
+    const left = parts.reduce((n, p) => (p === null ? n + 1 : n), 0);
+    onNote?.(`${src.label} 中断（${describeError(lastError)}），还剩 ${left} 块，换源续传`);
   }
 
-  const blob = new Blob(parts);
-  if (total !== null && blob.size !== total) {
-    throw new Error(`收到的字节数不对：${blob.size} / ${total}`);
-  }
-  return blob;
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+/** 把任意抛出来的东西变成一句话，用于提示与日志。 */
+function describeError(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String(err);
 }
 
 /**
@@ -638,27 +741,41 @@ async function cachedModelFetch(
   }
 
   const rel = relPath(canonical);
-  let source = await ensureSource();
+  const source = await ensureSource();
+  // 清单里查得到长度的才走分块；查不到就退化成一次性整取（正常永远走不到，
+  // 因为 `public/models` 下每一个文件都在清单里）。
+  const wanted = ONNX_RE.test(canonical) ? expectedModelBytes(rel) : null;
 
   const pull = async (src: ModelSource): Promise<Blob> => {
     const url = sourceUrl(src, rel);
-    if (ONNX_RE.test(canonical)) return rangeDownload(url, onNote);
     const res = await original(url, undefined);
     if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
     return res.blob();
   };
 
   let blob: Blob;
-  try {
-    blob = await pull(source);
-  } catch (err) {
-    // 主源挂了（被墙 / 限速 / 停服）就换另一个再试一次。缓存里已经有完整文件的
-    // 情况上面就返回了，走到这里说明确实得重下。
-    const e = err as { message?: string };
-    const alt = switchSource(source);
-    onNote?.(`${source.label} 取数失败（${e?.message ?? String(err)}），改用 ${alt.label} 重试`);
-    source = alt;
-    blob = await pull(alt);
+  let usedLabel = source.label;
+  let speedNote = '';
+  if (wanted !== null) {
+    // 大权重：并发分块 + 换源续传，全在 rangeDownload 里。
+    const got = await rangeDownload(sourceOrder(source), rel, wanted, onNote);
+    blob = got.blob;
+    usedLabel = got.source.label;
+    // **用实测速度，不用测速阶段那个 256 KB 的数字** —— 后者是突发值，
+    // 报告上写着 9 MB/s、实际跑 0.3 MB/s，正是 R18 那次误判的翻版。
+    const secs = Math.max(0.001, got.ms / 1000);
+    speedNote = ` · ${(blob.size / 1048576 / secs).toFixed(2)} MB/s · ${LANES} 路`;
+  } else {
+    try {
+      blob = await pull(source);
+    } catch (err) {
+      // 小文件（json / spm / txt）一次取完，主源挂了就换另一个再试一次。
+      // 缓存里已经有完整文件的情况上面就返回了，走到这里说明确实得重下。
+      const alt = switchSource(source);
+      onNote?.(`${source.label} 取数失败（${describeError(err)}），改用 ${alt.label} 重试`);
+      blob = await pull(alt);
+      usedLabel = alt.label;
+    }
   }
 
   if (cache) {
@@ -674,7 +791,7 @@ async function cachedModelFetch(
   }
 
   const speed = chosen && chosen.bytesPerSec > 0 ? ` · ${(chosen.bytesPerSec / 1048576).toFixed(2)} MB/s` : '';
-  return { response: responseFromBlob(blob), bytes: blob.size, note: `来自 ${source.label}${speed}` };
+  return { response: responseFromBlob(blob), bytes: blob.size, note: `来自 ${usedLabel}${speedNote || speed}` };
 }
 
 /** 已经被包过一次的 env 打个标记，避免重复包装（包装层会叠加计时）。 */
