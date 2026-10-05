@@ -19,7 +19,7 @@ import {
   type ProbeResult,
   type ProbeState,
 } from './probes';
-import { activeSource, sourceUrlsForTest } from '@/lib/modelSource';
+import { activeSource, clearModelCache, forgetSource, sourceUrlsForTest } from '@/lib/modelSource';
 
 const CARD = 'rounded-2xl border border-slate-700/70 bg-slate-900/70 p-4';
 const BTN =
@@ -93,6 +93,7 @@ export default function ProbeApp() {
   const [whisperSec, setWhisperSec] = useState(10);
   const [mtModel, setMtModel] = useState('Xenova/opus-mt-en-zh');
   const [copied, setCopied] = useState(false);
+  const [cacheMsg, setCacheMsg] = useState<string | null>(null);
   const reportRef = useRef<HTMLTextAreaElement>(null);
 
   const log = useCallback((line: string) => {
@@ -123,8 +124,27 @@ export default function ProbeApp() {
     [put],
   );
 
-  const all = useMemo(() => Object.values(results), [results]);
-  const done = all.filter((r) => r.state !== 'idle' && r.state !== 'running');
+  /**
+   * 复测前清掉模型缓存。
+   *
+   * 为什么必须有这个按钮：transformers.js 自己读缓存时只做 `caches.match()`，
+   * 命中就直接返回、**从不校验长度**。一次断线留下的半截 `.onnx` 会被永久命中，
+   * 症状是「清了缓存就好、不清就永远坏」——而手机上从浏览器菜单里清缓存非常难找。
+   */
+  const runClearCache = useCallback(async () => {
+    setBusy('clear');
+    setCacheMsg('清除中…');
+    try {
+      const n = await clearModelCache();
+      forgetSource();
+      setCacheMsg(n === 0 ? '模型缓存本来就是空的（不影响复测）' : `已清掉 ${n} 项已下载的模型文件`);
+      log(`清空模型缓存：删除 ${n} 项；同时忘掉上次的测速结论`);
+    } finally {
+      setBusy(null);
+    }
+  }, [log]);
+
+  const all = useMemo(() => Object.values(results), [results]);  const done = all.filter((r) => r.state !== 'idle' && r.state !== 'running');
 
   // ── 零下载的安全项，一次跑完 ──────────────────────────────
   const runSafe = () =>
@@ -514,6 +534,15 @@ export default function ProbeApp() {
             <button className={BTN_PRIMARY} disabled={busy !== null} onClick={() => void runMt()}>
               {busy === 'V4' ? '运行中…' : '跑翻译模型'}
             </button>
+          </div>
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <button className={BTN_GHOST} disabled={busy !== null} onClick={() => void runClearCache()}>
+              {busy === 'clear' ? '清除中…' : '清空模型缓存'}
+            </button>
+            <span className="text-xs text-slate-400">
+              {cacheMsg ??
+                '复测前先点一下：库里自带的缓存命中时不校验长度，断线留下的半截文件会被永久命中。它只删已下载的模型，不会碰 ORT 运行时（省下 26.8 MB 重下）。'}
+            </span>
           </div>
           {results.V4 && <ResultCard r={results.V4} />}
         </Section>
