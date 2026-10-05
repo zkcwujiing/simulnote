@@ -50,6 +50,20 @@ const MODEL_DIR = 'models';
 const MIRROR_BASE = 'https://hf-mirror.com/';
 
 /**
+ * ModelScope（阿里，modelscope.cn）—— 同样一份 `Xenova/*` 仓库，国内直连。
+ *
+ * 2026/10/5 实测（本机普通家宽，同一个 opus 编码器取前 8 MB）：
+ *   - 自建 GitHub Pages：**38,915 B/s**  ← 186 MB 的首次访问要一个半小时
+ *   - hf-mirror：208,339 B/s
+ *   - **ModelScope：9,062,348 B/s**  ← 比自建快 **233 倍**
+ * 路径形状与 Hugging Face 完全一致，**唯一的差别是 revision 用 `master` 而不是 `main`**：
+ *   https://modelscope.cn/models/Xenova/opus-mt-en-zh/resolve/master/onnx/encoder_model_quantized.onnx
+ * 已逐个核对过 24 个文件，字节数与本站托管的**完全一致**，CORS 返回 `*`，
+ * 且 `Content-Range` 里的总长度与 HF 一致 —— 是同一份仓库的镜像，不是重新导出的模型。
+ */
+const MODELSCOPE_BASE = 'https://modelscope.cn/models/';
+
+/**
  * 抓取日志 —— 每一条 transformers.js 发出的真实网络请求。
  *
  * 为什么需要它：真机上出现过 `TypeError: Load failed`，而那句话**不告诉你是谁失败了**。
@@ -134,6 +148,8 @@ export interface ModelSource {
    * `chooseSource()` 静默退回自建 —— 功能看起来在跑，其实一次都没生效。
    */
   layout: 'local' | 'hf';
+  /** `hf` 布局下的分支名：hf-mirror 用 `main`，ModelScope 用 `master`。 */
+  revision: string;
 }
 
 /** 测速用的文件与体积：拿 whisper 编码器头 256 KB，够判断量级又不浪费流量。 */
@@ -159,12 +175,21 @@ let sourcePromise: Promise<ModelSource> | null = null;
 
 /** 自行托管的模型目录，永远是兜底。 */
 function selfSource(): ModelSource {
-  return { label: '自建', base: localModelPath(), layout: 'local' };
+  return { label: '自建', base: localModelPath(), layout: 'local', revision: '' };
 }
 
-/** 所有候选源，顺序即测速并列时的优先级。 */
+/**
+ * 所有候选源，顺序即测速并列时的优先级。
+ *
+ * 自建**放在最后**：它现在是最慢的一个（38 KB/s），只作为「镜像全挂」时的兜底。
+ * 但它必须一直在列表里 —— 它是唯一一个不依赖第三方、我们说了算的源。
+ */
 function allSources(): ModelSource[] {
-  return [selfSource(), { label: 'hf-mirror', base: MIRROR_BASE, layout: 'hf' }];
+  return [
+    { label: 'ModelScope', base: MODELSCOPE_BASE, layout: 'hf', revision: 'master' },
+    { label: 'hf-mirror', base: MIRROR_BASE, layout: 'hf', revision: 'main' },
+    selfSource(),
+  ];
 }
 
 /** 模型在站点里的相对路径，例如 `Xenova/opus-mt-en-zh/onnx/encoder_model_quantized.onnx`。 */
@@ -179,16 +204,16 @@ function relPath(canonical: string): string {
  * 把本站的相对路径翻成 Hugging Face 的地址路径。
  * `Xenova/opus-mt-en-zh/onnx/x.onnx` → `Xenova/opus-mt-en-zh/resolve/main/onnx/x.onnx`
  */
-function hfPath(rel: string): string {
+function hfPath(rel: string, revision: string): string {
   const parts = rel.split('/');
   if (parts.length < 3) return rel;
-  // 站点路径没有 revision 这一层，镜像上统一用 main（与 scripts/fetch-models.mjs 拉的一致）。
-  return `${parts[0]}/${parts[1]}/resolve/main/${parts.slice(2).join('/')}`;
+  // 站点路径没有 revision 这一层；hf-mirror 是 main，ModelScope 是 master。
+  return `${parts[0]}/${parts[1]}/resolve/${revision}/${parts.slice(2).join('/')}`;
 }
 
 /** 把相对路径拼到某个源的基址上，注意两个源的目录布局不同。 */
 function sourceUrl(source: ModelSource, rel: string): string {
-  return `${source.base}${source.layout === 'hf' ? hfPath(rel) : rel}`;
+  return `${source.base}${source.layout === 'hf' ? hfPath(rel, source.revision) : rel}`;
 }
 
 /** 单源测速：取 PROBE_BYTES 字节，返回字节/秒。 */
@@ -270,7 +295,10 @@ function rememberSource(source: ModelSource): void {
 }
 
 /**
- * 两个源各测 256 KB，取快的那个；两个都失败就退回自建 —— 宁可慢，不能不能用。
+ * 三个源各测 256 KB，取快的那个；全失败就退回自建 —— 宁可慢，不能不能用。
+ *
+ * 自建是**最后才测**的：它现在只有 38 KB/s，测它一次要 6 秒多，
+ * 而它永远赢不了。只有镜像全挂了才值得花这 6 秒去确认兜底还活着。
  */
 async function chooseSource(): Promise<ModelSource> {
   const remembered = rememberedSource();
@@ -279,8 +307,10 @@ async function chooseSource(): Promise<ModelSource> {
     return remembered;
   }
   const list = allSources();
-  const speeds = await Promise.all(
-    list.map(async (s) => {
+  const mirrors = list.filter((s) => s.layout === 'hf');
+  const self = list[list.length - 1];
+  const mirrorSpeeds = await Promise.all(
+    mirrors.map(async (s) => {
       try {
         return await probeSource(s);
       } catch {
@@ -289,17 +319,31 @@ async function chooseSource(): Promise<ModelSource> {
     }),
   );
   let best = 0;
-  for (let i = 1; i < list.length; i++) if (speeds[i] > speeds[best]) best = i;
-  const picked = list[best];
-  const detail = list
-    .map((s, i) => `${s.label} ${speeds[i] < 0 ? '不可用' : `${(speeds[i] / 1048576).toFixed(2)} MB/s`}`)
+  for (let i = 1; i < mirrors.length; i++) if (mirrorSpeeds[i] > mirrorSpeeds[best]) best = i;
+
+  let picked = mirrors[best];
+  let speeds = mirrorSpeeds;
+  if (mirrorSpeeds[best] <= 0) {
+    // 镜像全灭：这时才去测自建，确认兜底可用。
+    let selfSpeed = -1;
+    try {
+      selfSpeed = await probeSource(self);
+    } catch {
+      selfSpeed = -1;
+    }
+    picked = self;
+    speeds = [selfSpeed];
+  }
+  const labels = mirrorSpeeds[best] <= 0 ? [self.label] : mirrors.map((s) => s.label);
+  const detail = labels
+    .map((label, i) => `${label} ${speeds[i] < 0 ? '不可用' : `${(speeds[i] / 1048576).toFixed(2)} MB/s`}`)
     .join(' · ');
   chosen = {
     label: picked.label,
-    bytesPerSec: Math.max(0, speeds[best]),
+    bytesPerSec: Math.max(0, speeds[mirrorSpeeds[best] <= 0 ? 0 : best]),
     note: `测速 ${detail} → 选 ${picked.label}`,
   };
-  if (speeds[best] > 0) rememberSource(picked);
+  if (chosen.bytesPerSec > 0) rememberSource(picked);
   return picked;
 }
 
@@ -309,10 +353,16 @@ function ensureSource(): Promise<ModelSource> {
   return sourcePromise;
 }
 
-/** 换到另一个源（当前源连续失败时用）。 */
+/**
+ * 换到下一个源（当前源连续失败时用）。
+ *
+ * 候选有三个，所以不能只找「另一个」：按列表顺序**环形**往后走，
+ * 走到自建（列表末尾、也是唯一不依赖第三方的那个）就停下来 —— 那里没法再退。
+ */
 function switchSource(used: ModelSource): ModelSource {
   const list = allSources();
-  const alt = list.find((s) => s.label !== used.label) ?? used;
+  const at = list.findIndex((s) => s.label === used.label);
+  const alt = list[at < 0 || at === list.length - 1 ? list.length - 1 : at + 1] ?? used;
   chosen = { label: alt.label, bytesPerSec: 0, note: `${used.label} 不可用，改用 ${alt.label}` };
   sourcePromise = Promise.resolve(alt);
   return alt;

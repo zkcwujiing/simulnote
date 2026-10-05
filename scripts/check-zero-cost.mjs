@@ -45,9 +45,23 @@ const ALLOWED_HOSTS = [
   //   GitHub Pages（自建）0.086 MB/s —— 90 秒只收到 7.7MB 直接超时；
   //   hf-mirror.com       1.638 MB/s —— 快 19 倍。
   // 小米平板真机报告印证：V4 首访加载 729 秒，与 0.15 MB/s 下 108MB 的耗时吻合。
-  // 运行时会在两个源之间测速选快的，**自建永远是兜底**：镜像被墙/限速/停服时
+  // 运行时会在三个源之间测速选快的，**自建永远是兜底**：镜像被墙/限速/停服时
   // 自动退回自建，站点照常可用。详见 src/lib/modelSource.ts 的 MIRROR_BASE 注释。
   'hf-mirror.com',
+  // ModelScope（阿里，modelscope.cn）—— 同一份 `Xenova/*` 仓库的国内镜像。
+  // 2026/10/5 又测了一次，这次数字比上面那批更极端（同一个 opus 编码器取前 8MB）：
+  //   GitHub Pages（自建）38,915 B/s —— 186MB 的首访要**一个半小时**；
+  //   hf-mirror.com      208,339 B/s；
+  //   ModelScope       9,062,348 B/s —— 比自建快 233 倍。
+  // 免费、无需账号、无需密钥。路径形状与 HF 一致（只有 revision 用 master）。
+  // 24 个文件逐个核对过：字节数与本站托管的完全一致，CORS 返回 `*`。
+  'modelscope.cn',
+  // onnxruntime-web 的 npm 镜像（阿里）。用途与上面两条不同，是**代码产物**而不是模型：
+  // ORT 的 asyncify wasm 有 26.8MB，原先只能从自建取，实测 27,589 B/s → 单独就要 16 分钟。
+  // 这里 3.44 MB/s，快 125 倍。版本号在构建期注入（见 vite.config.ts 的 ortVersion()），
+  // 运行时先取几十 KB 的 .mjs **核对长度**，不对就退回自建 —— 见 src/lib/ortEnv.ts。
+  // 仍然是免费镜像、无需账号；黑名单里的公共 CDN（jsDelivr 等）**没有**被放行。
+  'registry.npmmirror.com',
 ];
 
 /** 显式点名的高风险主机 —— 命中就直接报错，不必等 allowlist 判断。 */

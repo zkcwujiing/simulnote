@@ -2,7 +2,7 @@ import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import { fileURLToPath, URL } from 'node:url';
-import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 // GitHub Pages 的项目站点部署在 /<仓库名>/ 子路径下，Cloudflare Pages 部署在根路径。
@@ -114,8 +114,24 @@ function socialMeta(): Plugin {
   };
 }
 
+/**
+ * onnxruntime-web 的版本号，注入成 `__ORT_VERSION__`。
+ *
+ * `lib/ortEnv.ts` 靠它拼 npmmirror 的地址：
+ *   https://registry.npmmirror.com/onnxruntime-web/<版本>/files/dist/ort-wasm-*.wasm
+ * 必须是**构建时真正装的那一份**，否则镜像上可能根本没有这个版本，
+ * 运行时会退化成自建 —— 慢，但仍然正确（`configureOrtWasm` 会核对文件长度）。
+ */
+function ortVersion(): string {
+  const pkg = join(fileURLToPath(new URL('.', import.meta.url)), 'node_modules/onnxruntime-web/package.json');
+  return JSON.parse(readFileSync(pkg, 'utf8')).version as string;
+}
+
 export default defineConfig({
   base,
+  define: {
+    __ORT_VERSION__: JSON.stringify(ortVersion()),
+  },
   plugins: [react(), tailwindcss(), ortWasmPolicy(), ortRuntime(), socialMeta()],
   resolve: {
     alias: {

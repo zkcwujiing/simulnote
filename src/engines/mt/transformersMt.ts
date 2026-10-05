@@ -133,8 +133,9 @@ export class TransformersMtEngine implements MtEngine {
     // 与 ASR 引擎同一套来源规则：只从本站 /models/ 读，不回落到 HF。见 lib/modelSource.ts
     configureModelSource(env);
 
-    // 与 ASR 引擎共用同一份 wasm 外置配置（见 lib/ortEnv.ts）
-    configureOrtWasm(env);
+    // 与 ASR 引擎共用同一份 wasm 外置配置（见 lib/ortEnv.ts）。
+    // 现在是异步的：它会先用几十 KB 探一下镜像通不通，不通才退回自建。
+    await configureOrtWasm(env);
 
     // 桌面有 WebGPU 就用；手机上 WebGPU 跑机器翻译会吃掉大量内存（docs/07 R1），
     // 一律退回 WASM。轻量档（手机 / 小内存）连 WASM 也用最省的配置。

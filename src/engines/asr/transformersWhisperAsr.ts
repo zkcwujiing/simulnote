@@ -153,9 +153,9 @@ export class TransformersWhisperAsrEngine implements AsrEngine {
     // 原因见 lib/modelSource.ts：huggingface.co 在国内完全不通，直接拉必然超时。
     configureModelSource(env);
 
-    // 若构建时外置了 ORT 的 wasm（Cloudflare Pages 有 25MiB 单文件上限），
-    // 这里把基址交给 ORT。不设 VITE_ORT_WASM_BASE 时是空操作。
-    configureOrtWasm(env);
+    // ORT 的 wasm 从哪儿取（npmmirror 优先、自建兜底、VITE_ORT_WASM_BASE 最优先）
+    // 见 lib/ortEnv.ts。异步：先用几十 KB 探一下加速源通不通。
+    await configureOrtWasm(env);
 
     // WebGPU 只在**桌面**上开：手机上 WebGPU 跑 Whisper 的显存/内存占用是 GB 级，
     // 属于 docs/07 的 R1（手机内存不足）。手机上宁可慢，也不能白屏。

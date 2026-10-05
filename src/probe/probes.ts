@@ -656,7 +656,7 @@ export async function benchWhisper(opts: WhisperBenchOptions): Promise<ModelTimi
     opts.onNote?.(`模块加载完成（${Math.round(performance.now() - t0)} ms）`);
 
     configureModelSource(env);
-    const wasmPaths = configureOrtWasm(env);
+    const wasmPaths = await configureOrtWasm(env);
     opts.onNote?.(
       `模型来源：本站 ${String((env as { localModelPath?: string }).localModelPath ?? '')}；` +
         `ORT 运行时：${describeWasmPaths(wasmPaths)}`,
@@ -756,7 +756,7 @@ export async function benchMt(opts: {
     opts.onNote?.('动态导入 @huggingface/transformers …');
     const { pipeline, env } = await import('@huggingface/transformers');
     configureModelSource(env);
-    const wasmPaths = configureOrtWasm(env);
+    const wasmPaths = await configureOrtWasm(env);
     opts.onNote?.(`ORT 运行时：${describeWasmPaths(wasmPaths)}`);
     result.ortRuntime = describeWasmPaths(wasmPaths);
     resetFetchLog();
