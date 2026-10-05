@@ -19,6 +19,7 @@ import {
   type ProbeResult,
   type ProbeState,
 } from './probes';
+import { activeSource } from '@/lib/modelSource';
 
 const CARD = 'rounded-2xl border border-slate-700/70 bg-slate-900/70 p-4';
 const BTN =
@@ -314,6 +315,7 @@ export default function ProbeApp() {
           '推理耗时（ms）': r.inferMs,
           RTF: r.rtf,
           'ORT 运行时来源': r.ortRuntime ?? '—',
+          '模型来源（自动测速）': activeSource()?.note ?? '—',
           '识别输出（合成音频，仅证明链路通，不代表质量）': r.text?.slice(0, 200) ?? '—',
         },
       };
@@ -349,10 +351,11 @@ export default function ProbeApp() {
           '吞吐（句/秒）': r.throughputPerSec ?? '—',
           '单句耗时（ms）': r.perSentenceMs.join(', ') || '—',
           'ORT 运行时来源': r.ortRuntime ?? '—',
-          // 这一行是**对照组**：故意用最朴素的一次性 fetch 把整个文件拿下来。
-          // 它在手机上本来就是断的（见 docs/07 R17），留着是为了对照「分块下载」确实修好了什么。
-          // 所以它报失败、而上面「库发出的网络请求」报成功，是**预期结果**，不是矛盾。
-          '裸取诊断（对照组：一次性整取，预期会断）': r.rawProbe ?? '（没跑，说明加载成功）',
+          '模型来源（自动测速）': activeSource()?.note ?? '—',
+          // 这一行是**对照组**：故意用最朴素的一次性 fetch 把整个文件拿下来，
+          // 绕开 transformers 与 ORT。它报成功还是失败，都能说明「网络这一层」的状态：
+          // 失败 = 这条源站确实撑不住长响应；成功 = 就是库或缓存的问题。
+          '裸取诊断（对照组：绕开库直连，一次性整取）': r.rawProbe ?? '（没跑，说明加载成功）',
           '库发出的网络请求（最近 8 条）': r.fetchLog ?? '—',
           '产物样例（空字符串通常意味着需要用带语言前缀的模型）': r.outputs[0] ?? '—',
         },

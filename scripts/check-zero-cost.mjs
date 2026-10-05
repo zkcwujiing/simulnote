@@ -30,7 +30,7 @@ const SCAN_DIRS = ['src', 'public'];
 const SCAN_FILES = ['index.html', 'probe.html'];
 const SKIP_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp', '.ico', '.woff', '.woff2', '.onnx', '.wasm', '.mp3']);
 
-/** 允许出现的外部主机：只剩「本项目自己的 GitHub Release 资产」这一类。 */
+/** 允许出现的外部主机：模型镜像 + 本项目自己的 GitHub Release 资产。 */
 const ALLOWED_HOSTS = [
   // 仅用于「本仓库自己的 GitHub Release 资产」（ORT 的 wasm 体积超过
   // Cloudflare Pages 的 25MiB 单文件上限，只能外置）。免费、无需账号、无配额费用。
@@ -40,6 +40,14 @@ const ALLOWED_HOSTS = [
   'github.com',
   'objects.githubusercontent.com',
   'release-assets.githubusercontent.com',
+  // 模型镜像。**这不是新引入的依赖，而是给已经存在的大文件找了条快路。**
+  // 2026/10/5 实测（本机家宽，同一个 opus 编码器、同样取 8MB）：
+  //   GitHub Pages（自建）0.086 MB/s —— 90 秒只收到 7.7MB 直接超时；
+  //   hf-mirror.com       1.638 MB/s —— 快 19 倍。
+  // 小米平板真机报告印证：V4 首访加载 729 秒，与 0.15 MB/s 下 108MB 的耗时吻合。
+  // 运行时会在两个源之间测速选快的，**自建永远是兜底**：镜像被墙/限速/停服时
+  // 自动退回自建，站点照常可用。详见 src/lib/modelSource.ts 的 MIRROR_BASE 注释。
+  'hf-mirror.com',
 ];
 
 /** 显式点名的高风险主机 —— 命中就直接报错，不必等 allowlist 判断。 */

@@ -35,6 +35,21 @@ interface TransformersEnvLike {
 const MODEL_DIR = 'models';
 
 /**
+ * 模型镜像基址 —— **提速项，不是依赖**。
+ *
+ * 为什么加它（2026/10/5 实测，本机普通家宽，同一个 opus 编码器、同样是 8 MB 区间）：
+ *   - GitHub Pages（自建）  **0.086 MB/s** —— 90 秒只收到 7.7 MB，直接超时；
+ *   - hf-mirror.com        **1.638 MB/s** —— 快 19 倍。
+ * 小米平板的真机报告印证了同一件事：V4 首访加载 729 秒，按 0.15 MB/s 倒推，
+ * 108 MB 的翻译模型正好是 700 多秒。**慢的不是模型、不是分块策略，是源站。**
+ *
+ * 但镜像随时可能被墙、限速或者停服，所以它**没有取代自建**：
+ * 启动时对两个源各测 256 KB，谁快用谁；谁中途连续失败就换另一个。
+ * 镜像不通时自动退回自建，站点依旧完全可用（只是慢）。
+ */
+const MIRROR_BASE = 'https://hf-mirror.com/';
+
+/**
  * 抓取日志 —— 每一条 transformers.js 发出的真实网络请求。
  *
  * 为什么需要它：真机上出现过 `TypeError: Load failed`，而那句话**不告诉你是谁失败了**。
@@ -91,6 +106,185 @@ export function siteBase(): string {
 /** 模型的绝对路径（相对站点根），例如 `/` 或 `/simulnote/` + `models/`。 */
 export function localModelPath(): string {
   return `${siteBase()}${MODEL_DIR}/`;
+}
+
+/* ------------------------------------------------------------------ *
+ * 多源测速：谁快用谁
+ *
+ * transformers.js 只会朝 `localModelPath`（也就是自建）要文件，
+ * 但我们在 `instrumentFetch` 里截住了所有 `/models/` 请求，
+ * 所以可以把地址改写到「当前测出来最快的那个源」上去。
+ * 缓存键一律用**自建的规范地址**，这样换源之后之前下好的文件照样命中。
+ * ------------------------------------------------------------------ */
+
+/** 一个模型来源。 */
+export interface ModelSource {
+  /** 报告里显示的短名。 */
+  label: string;
+  /** 基址，末尾必有斜杠。 */
+  base: string;
+}
+
+/** 测速用的文件与体积：拿 whisper 编码器头 256 KB，够判断量级又不浪费流量。 */
+const PROBE_BYTES = 256 * 1024;
+const PROBE_REL = 'Xenova/whisper-tiny.en/onnx/encoder_model_quantized.onnx';
+/** 单个源测速的超时。自建在弱网下 256 KB 也就 3 秒左右，20 秒足够。 */
+const PROBE_TIMEOUT_MS = 20000;
+/** 记住上次的选择，1 小时内不重复测速。 */
+const SOURCE_KEY = 'simulnote.modelSource';
+const SOURCE_TTL_MS = 60 * 60 * 1000;
+
+/** 本次会话实际选用的源，供探针页展示。 */
+export interface SourceChoice {
+  label: string;
+  /** 探针实测速度，字节/秒；0 表示沿用上次结果、这次没测。 */
+  bytesPerSec: number;
+  /** 一句话说明，直接进报告。 */
+  note: string;
+}
+
+let chosen: SourceChoice | null = null;
+let sourcePromise: Promise<ModelSource> | null = null;
+
+/** 自行托管的模型目录，永远是兜底。 */
+function selfSource(): ModelSource {
+  return { label: '自建', base: localModelPath() };
+}
+
+/** 所有候选源，顺序即测速并列时的优先级。 */
+function allSources(): ModelSource[] {
+  return [selfSource(), { label: 'hf-mirror', base: MIRROR_BASE }];
+}
+
+/** 模型在站点里的相对路径，例如 `Xenova/opus-mt-en-zh/onnx/encoder_model_quantized.onnx`。 */
+function relPath(canonical: string): string {
+  const prefix = localModelPath();
+  if (canonical.startsWith(prefix)) return canonical.slice(prefix.length);
+  const i = canonical.indexOf('/models/');
+  return i >= 0 ? canonical.slice(i + '/models/'.length) : canonical;
+}
+
+/** 把相对路径拼到某个源的基址上。 */
+function sourceUrl(source: ModelSource, rel: string): string {
+  return `${source.base}${rel}`;
+}
+
+/** 单源测速：取 PROBE_BYTES 字节，返回字节/秒。 */
+async function probeSource(source: ModelSource): Promise<number> {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), PROBE_TIMEOUT_MS);
+  try {
+    const startedAt = Date.now();
+    const res = await fetch(sourceUrl(source, PROBE_REL), {
+      headers: { Range: `bytes=0-${PROBE_BYTES - 1}` },
+      cache: 'no-store',
+      signal: ctl.signal,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const buf = await res.arrayBuffer();
+    const ms = Math.max(1, Date.now() - startedAt);
+    if (buf.byteLength === 0) throw new Error('收到 0 字节');
+    fetchLog.push({
+      url: `${source.label}（测速）`,
+      status: res.status,
+      ok: true,
+      bytes: buf.byteLength,
+      ms,
+      error: null,
+      note: `${(buf.byteLength / 1048576 / (ms / 1000)).toFixed(2)} MB/s`,
+    });
+    trimLog();
+    return buf.byteLength / (ms / 1000);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** 读上一次的选择（1 小时内有效），避免每次打开都重测、白花 512 KB 流量。 */
+function rememberedSource(): ModelSource | null {
+  try {
+    const raw = localStorage.getItem(SOURCE_KEY);
+    if (!raw) return null;
+    const saved = JSON.parse(raw) as { label?: string; at?: number };
+    if (!saved.label || typeof saved.at !== 'number') return null;
+    if (Date.now() - saved.at > SOURCE_TTL_MS) return null;
+    return allSources().find((s) => s.label === saved.label) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function rememberSource(source: ModelSource): void {
+  try {
+    localStorage.setItem(SOURCE_KEY, JSON.stringify({ label: source.label, at: Date.now() }));
+  } catch {
+    // 隐私模式下写不了，无所谓：本次会话内照样有效
+  }
+}
+
+/**
+ * 两个源各测 256 KB，取快的那个；两个都失败就退回自建 —— 宁可慢，不能不能用。
+ */
+async function chooseSource(): Promise<ModelSource> {
+  const remembered = rememberedSource();
+  if (remembered) {
+    chosen = { label: remembered.label, bytesPerSec: 0, note: `${remembered.label}（1 小时内沿用上次的测速结果）` };
+    return remembered;
+  }
+  const list = allSources();
+  const speeds = await Promise.all(
+    list.map(async (s) => {
+      try {
+        return await probeSource(s);
+      } catch {
+        return -1;
+      }
+    }),
+  );
+  let best = 0;
+  for (let i = 1; i < list.length; i++) if (speeds[i] > speeds[best]) best = i;
+  const picked = list[best];
+  const detail = list
+    .map((s, i) => `${s.label} ${speeds[i] < 0 ? '不可用' : `${(speeds[i] / 1048576).toFixed(2)} MB/s`}`)
+    .join(' · ');
+  chosen = {
+    label: picked.label,
+    bytesPerSec: Math.max(0, speeds[best]),
+    note: `测速 ${detail} → 选 ${picked.label}`,
+  };
+  if (speeds[best] > 0) rememberSource(picked);
+  return picked;
+}
+
+/** 取当前源，必要时先测速。 */
+function ensureSource(): Promise<ModelSource> {
+  if (!sourcePromise) sourcePromise = chooseSource();
+  return sourcePromise;
+}
+
+/** 换到另一个源（当前源连续失败时用）。 */
+function switchSource(used: ModelSource): ModelSource {
+  const list = allSources();
+  const alt = list.find((s) => s.label !== used.label) ?? used;
+  chosen = { label: alt.label, bytesPerSec: 0, note: `${used.label} 不可用，改用 ${alt.label}` };
+  sourcePromise = Promise.resolve(alt);
+  return alt;
+}
+
+/** 本次会话选用的源，给探针页用。还没选时为 null。 */
+export function activeSource(): SourceChoice | null {
+  return chosen;
+}
+
+/** 供排障用：忘掉上次的测速结论，下次强制重新测。 */
+export function forgetSource(): void {
+  try {
+    localStorage.removeItem(SOURCE_KEY);
+  } catch {
+    // 忽略
+  }
+  sourcePromise = null;
+  chosen = null;
 }
 
 /**
@@ -197,12 +391,20 @@ export async function clearModelCache(): Promise<number> {
   }
 }
 
-/** 把一段内存里的字节伪装成一个正常的 200 响应，交给 transformers.js。 */
+/**
+ * 把一段内存里的字节伪装成一个正常的 200 响应，交给 transformers.js。
+ *
+ * `content-length` 是**必填的**：transformers.js 的进度回调靠它算百分比，
+ * 缺了它整段下载在界面上会显示成「卡住不动」，报告里的「下载耗时」也会变成 0。
+ */
 function responseFromBlob(blob: Blob): Response {
   return new Response(blob, {
     status: 200,
     statusText: 'OK',
-    headers: { 'content-type': 'application/octet-stream' },
+    headers: {
+      'content-type': 'application/octet-stream',
+      'content-length': String(blob.size),
+    },
   });
 }
 
@@ -245,6 +447,8 @@ async function rangeDownload(url: string, onNote?: (note: string) => void): Prom
   let offset = 0;
   let total: number | null = null;
   let failures = 0;
+  /** 连续成功的块数，用来把因失败缩小的块重新涨回去。 */
+  let okStreak = 0;
 
   while (total === null || offset < total) {
     try {
@@ -255,11 +459,22 @@ async function rangeDownload(url: string, onNote?: (note: string) => void): Prom
       if (got.total !== null) total = got.total;
       failures = 0;
       if (got.whole) break;
+      failures = 0;
+      // 失败过的块会减半，但**不能一直小下去**：实测 hf-mirror 取 53 MB 时出现过
+      // 32 次重试，如果块停在 512 KB，剩下的文件要多发几十个请求、每个都带一次往返，
+      // 总时长被拖到 305 秒（平均只有 0.165 MB/s）。连续成功 4 块就翻倍涨回去。
+      okStreak += 1;
+      if (okStreak >= 4 && chunk < CHUNK_BYTES) {
+        chunk = Math.min(CHUNK_BYTES, chunk * 2);
+        okStreak = 0;
+        onNote?.(`连续成功，块大小升回 ${(chunk / 1048576).toFixed(1)} MB`);
+      }
       const done = (offset / 1048576).toFixed(1);
       const all = total === null ? '?' : (total / 1048576).toFixed(1);
       onNote?.(`分块下载 ${done} / ${all} MB`);
     } catch (err) {
       failures += 1;
+      okStreak = 0;
       if (failures >= MAX_ATTEMPTS) throw err;
       if (chunk > MIN_CHUNK_BYTES) {
         chunk = Math.max(MIN_CHUNK_BYTES, Math.floor(chunk / 2));
@@ -280,16 +495,19 @@ async function rangeDownload(url: string, onNote?: (note: string) => void): Prom
 
 /**
  * 模型文件的取数总入口：先看自己管的缓存，没有就下载（大文件分块），校验长度后写回缓存。
+ *
+ * `canonical` 是**自建的规范地址**（transformers.js 要的那个）。真正去哪儿取由测速决定，
+ * 但**缓存键永远用规范地址** —— 换源之后之前下好的文件照样命中，不会白下第二遍。
  */
 async function cachedModelFetch(
-  url: string,
+  canonical: string,
   original: (input: string | URL, init?: RequestInit) => Promise<Response>,
   onNote?: (note: string) => void,
 ): Promise<{ response: Response; bytes: number; note: string | null }> {
   const cache = await openModelCache();
 
   if (cache) {
-    const hit = await cache.match(url);
+    const hit = await cache.match(canonical);
     if (hit) {
       const blob = await hit.blob();
       const declared = Number(hit.headers.get(BYTES_HEADER));
@@ -301,17 +519,33 @@ async function cachedModelFetch(
         };
       }
       // 长度对不上 = 上次断线留下的半截文件。**必须删掉**，否则会永远命中它。
-      await cache.delete(url);
+      await cache.delete(canonical);
       onNote?.('缓存条目长度不对，已删除并重新下载');
     }
   }
 
-  let blob: Blob;
-  if (ONNX_RE.test(url)) {
-    blob = await rangeDownload(url, onNote);
-  } else {
+  const rel = relPath(canonical);
+  let source = await ensureSource();
+
+  const pull = async (src: ModelSource): Promise<Blob> => {
+    const url = sourceUrl(src, rel);
+    if (ONNX_RE.test(canonical)) return rangeDownload(url, onNote);
     const res = await original(url, undefined);
-    blob = await res.blob();
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    return res.blob();
+  };
+
+  let blob: Blob;
+  try {
+    blob = await pull(source);
+  } catch (err) {
+    // 主源挂了（被墙 / 限速 / 停服）就换另一个再试一次。缓存里已经有完整文件的
+    // 情况上面就返回了，走到这里说明确实得重下。
+    const e = err as { message?: string };
+    const alt = switchSource(source);
+    onNote?.(`${source.label} 取数失败（${e?.message ?? String(err)}），改用 ${alt.label} 重试`);
+    source = alt;
+    blob = await pull(alt);
   }
 
   if (cache) {
@@ -320,13 +554,14 @@ async function cachedModelFetch(
         status: 200,
         headers: { 'content-type': 'application/octet-stream', [BYTES_HEADER]: String(blob.size) },
       });
-      await cache.put(url, stored);
+      await cache.put(canonical, stored);
     } catch {
       // 配额满 / put 被拒：这次照样能用，只是下次还得再下。
     }
   }
 
-  return { response: responseFromBlob(blob), bytes: blob.size, note: null };
+  const speed = chosen && chosen.bytesPerSec > 0 ? ` · ${(chosen.bytesPerSec / 1048576).toFixed(2)} MB/s` : '';
+  return { response: responseFromBlob(blob), bytes: blob.size, note: `来自 ${source.label}${speed}` };
 }
 
 /** 已经被包过一次的 env 打个标记，避免重复包装（包装层会叠加计时）。 */
