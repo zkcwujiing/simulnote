@@ -123,6 +123,17 @@ export interface ModelSource {
   label: string;
   /** 基址，末尾必有斜杠。 */
   base: string;
+  /**
+   * 目录布局。`local` 是本站的 `models/<组织>/<模型>/<文件>`；
+   * `hf` 是 Hugging Face 的 `/<组织>/<模型>/resolve/main/<文件>`。
+   *
+   * **这两个布局不能混用**（2026/10/5 实测，对着 hf-mirror.com 打）：
+   *   `.../Xenova/opus-mt-en-zh/onnx/...onnx`            → HTTP 404（curl 连不上时更是直接超时）
+   *   `.../Xenova/opus-mt-en-zh/resolve/main/onnx/...`   → 302 → 206 · Content-Range 52899742
+   * 第一次上线时就是漏了 `resolve/main`，导致镜像测速永远失败、
+   * `chooseSource()` 静默退回自建 —— 功能看起来在跑，其实一次都没生效。
+   */
+  layout: 'local' | 'hf';
 }
 
 /** 测速用的文件与体积：拿 whisper 编码器头 256 KB，够判断量级又不浪费流量。 */
@@ -148,12 +159,12 @@ let sourcePromise: Promise<ModelSource> | null = null;
 
 /** 自行托管的模型目录，永远是兜底。 */
 function selfSource(): ModelSource {
-  return { label: '自建', base: localModelPath() };
+  return { label: '自建', base: localModelPath(), layout: 'local' };
 }
 
 /** 所有候选源，顺序即测速并列时的优先级。 */
 function allSources(): ModelSource[] {
-  return [selfSource(), { label: 'hf-mirror', base: MIRROR_BASE }];
+  return [selfSource(), { label: 'hf-mirror', base: MIRROR_BASE, layout: 'hf' }];
 }
 
 /** 模型在站点里的相对路径，例如 `Xenova/opus-mt-en-zh/onnx/encoder_model_quantized.onnx`。 */
@@ -164,18 +175,30 @@ function relPath(canonical: string): string {
   return i >= 0 ? canonical.slice(i + '/models/'.length) : canonical;
 }
 
-/** 把相对路径拼到某个源的基址上。 */
+/**
+ * 把本站的相对路径翻成 Hugging Face 的地址路径。
+ * `Xenova/opus-mt-en-zh/onnx/x.onnx` → `Xenova/opus-mt-en-zh/resolve/main/onnx/x.onnx`
+ */
+function hfPath(rel: string): string {
+  const parts = rel.split('/');
+  if (parts.length < 3) return rel;
+  // 站点路径没有 revision 这一层，镜像上统一用 main（与 scripts/fetch-models.mjs 拉的一致）。
+  return `${parts[0]}/${parts[1]}/resolve/main/${parts.slice(2).join('/')}`;
+}
+
+/** 把相对路径拼到某个源的基址上，注意两个源的目录布局不同。 */
 function sourceUrl(source: ModelSource, rel: string): string {
-  return `${source.base}${rel}`;
+  return `${source.base}${source.layout === 'hf' ? hfPath(rel) : rel}`;
 }
 
 /** 单源测速：取 PROBE_BYTES 字节，返回字节/秒。 */
 async function probeSource(source: ModelSource): Promise<number> {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), PROBE_TIMEOUT_MS);
+  const url = sourceUrl(source, PROBE_REL);
+  const startedAt = Date.now();
   try {
-    const startedAt = Date.now();
-    const res = await fetch(sourceUrl(source, PROBE_REL), {
+    const res = await fetch(url, {
       headers: { Range: `bytes=0-${PROBE_BYTES - 1}` },
       cache: 'no-store',
       signal: ctl.signal,
@@ -195,9 +218,33 @@ async function probeSource(source: ModelSource): Promise<number> {
     });
     trimLog();
     return buf.byteLength / (ms / 1000);
+  } catch (err) {
+    // **失败也必须进日志。** 上一次漏掉 `resolve/main` 时，镜像每次都 404，
+    // 但失败被这里静默吞掉，报告上只看到「测速 → 选 自建」，谁也想不到是地址拼错。
+    fetchLog.push({
+      url: `${source.label}（测速）`,
+      status: null,
+      ok: false,
+      bytes: null,
+      ms: Date.now() - startedAt,
+      error: err instanceof Error ? err.message : String(err),
+      note: url,
+    });
+    trimLog();
+    throw err;
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * 排障用：把某个模型文件在两个源上的**确切地址**列出来，给探针页显示。
+ * 加它的原因就是上面那次 404 —— 报告上只有一个「选 自建」的结论，
+ * 看不出镜像到底是连不上、404 了、还是慢，只能靠猜。
+ */
+export function sourceUrlsForTest(): string[] {
+  const rel = PROBE_REL;
+  return allSources().map((s) => `${s.label}: ${sourceUrl(s, rel)}`);
 }
 
 /** 读上一次的选择（1 小时内有效），避免每次打开都重测、白花 512 KB 流量。 */

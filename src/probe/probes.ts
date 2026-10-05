@@ -13,7 +13,7 @@
  * 测别的 id 会立刻报 `ModelFileNotFoundError`，那不是坏了，是本站没托管它。
  */
 
-import { configureModelSource, fetchLogText, localModelPath, resetFetchLog } from '@/lib/modelSource';
+import { configureModelSource, fetchLogText, forgetSource, localModelPath, resetFetchLog } from '@/lib/modelSource';
 import { configureOrtWasm } from '@/lib/ortEnv';
 
 /**
@@ -662,6 +662,8 @@ export async function benchWhisper(opts: WhisperBenchOptions): Promise<ModelTimi
         `ORT 运行时：${describeWasmPaths(wasmPaths)}`,
     );
     result.ortRuntime = describeWasmPaths(wasmPaths);
+    // 同 benchMt：探针要的是此刻的真实测速，不沿用 localStorage 里的旧结论。
+    forgetSource();
 
     let bytes = 0;
     let firstProgressAt: number | null = null;
@@ -758,6 +760,9 @@ export async function benchMt(opts: {
     opts.onNote?.(`ORT 运行时：${describeWasmPaths(wasmPaths)}`);
     result.ortRuntime = describeWasmPaths(wasmPaths);
     resetFetchLog();
+    // 探针的职责就是「现在测一次」，所以不沿用 localStorage 里上次的测速结论。
+    // 否则报告上只会写「1 小时内沿用上次的测速结果」，看不出两个源此刻的真实状态。
+    forgetSource();
 
     const loadStart = performance.now();
     const translator = await pipeline('translation', opts.modelId, {
