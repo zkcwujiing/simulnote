@@ -57,7 +57,7 @@
 
 declare const __ORT_VERSION__: string;
 
-import { siteBase } from './modelSource';
+import { pushFetchRecord, siteBase } from './modelSource';
 
 /** 站点里存放 ORT 运行时的目录名（相对站点根），与 vite.config.ts 的 ortRuntime() 一致。 */
 const ORT_DIR = 'ort';
@@ -71,11 +71,7 @@ const PLAIN_STEM = 'ort-wasm-simd-threaded';
  */
 const ORT_NPM_BASE = `https://registry.npmmirror.com/onnxruntime-web/${__ORT_VERSION__}/files/dist/`;
 
-/** 探测加速源用的小文件（.mjs 只有几十 KB），以及它应有的长度。长度不符就当源不可用。 */
-const PROBE_FILE_BYTES: Record<string, number> = {
-  [`${ASYNCIFY_STEM}.mjs`]: 53057,
-  [`${PLAIN_STEM}.mjs`]: 24381,
-};
+/** 探测加速源用的小文件（.mjs 只有几十 KB）的超时。 */
 const PROBE_TIMEOUT_MS = 6000;
 
 /**
@@ -133,33 +129,181 @@ function isSafariBelow26(): boolean {
   return Number(match[1]) < 26;
 }
 
-/** 某个基址下的 ORT 运行时两个文件（与 transformers.js 的命名规则一致）。 */
-function filesUnder(base: string): { mjs: string; wasm: string } {
-  const stem = isSafariBelow26() ? PLAIN_STEM : ASYNCIFY_STEM;
+/** 两套运行时的确切字节数（与 `node_modules/onnxruntime-web/dist/` 里那份逐字节一致）。 */
+const RUNTIME_BYTES: Record<string, { mjs: number; wasm: number }> = {
+  [ASYNCIFY_STEM]: { mjs: 53057, wasm: 26861777 },
+  [PLAIN_STEM]: { mjs: 24381, wasm: 14264838 },
+};
+
+/** 运行时在 Cache Storage 里的桶名。与模型缓存分开，清模型缓存时不会误删它。 */
+const ORT_CACHE = 'simulnote-ort-v1';
+
+/** 分块下载参数，与 `lib/modelSource.ts` 里 `.onnx` 那套同源同思路。 */
+const CHUNK_BYTES = 2 * 1024 * 1024;
+const MIN_CHUNK_BYTES = 512 * 1024;
+const MAX_ATTEMPTS = 4;
+const WASM_TIMEOUT_MS = 30000;
+
+/**
+ * 首选哪一套运行时。
+ *
+ * 规则照抄 transformers.js 自己的选择（`IS_SAFARI_BELOW_26 && !IS_WEBGPU_AVAILABLE`）：
+ * 默认 asyncify，只有「Safari 且主版本 < 26 且没有 WebGPU」才退回不带后缀的那份。
+ */
+function primaryStem(): string {
+  return isSafariBelow26() ? PLAIN_STEM : ASYNCIFY_STEM;
+}
+
+/** 某个基址 + 某一套变体下的两个文件地址。 */
+function filesUnder(base: string, stem: string): { mjs: string; wasm: string } {
   return { mjs: `${base}${stem}.mjs`, wasm: `${base}${stem}.wasm` };
 }
 
 /** 本站 ORT 运行时的两个文件地址（绝对路径，带 base 前缀）。 */
 export function ortRuntimeFiles(): { mjs: string; wasm: string } {
-  return filesUnder(`${siteBase()}${ORT_DIR}/`);
+  return filesUnder(`${siteBase()}${ORT_DIR}/`, primaryStem());
+}
+
+/** 本次会话实际用上的运行时，给探针页展示。 */
+export interface OrtRuntimeChoice {
+  /** 变体名，例如 `asyncify`。 */
+  stem: string;
+  /** 来自哪个源。 */
+  source: string;
+  mjs: string;
+  bytes: number;
+  ms: number;
+  cached: boolean;
+  note: string;
+}
+
+let runtimeChoice: OrtRuntimeChoice | null = null;
+
+export function activeOrtRuntime(): OrtRuntimeChoice | null {
+  return runtimeChoice;
+}
+
+async function openOrtCache(): Promise<Cache | null> {
+  try {
+    if (typeof caches === 'undefined') return null;
+    return await caches.open(ORT_CACHE);
+  } catch {
+    return null;
+  }
+}
+
+/** 从缓存里取一份**长度正确**的运行时字节。长度不对就当没有（半截文件比没有更坏）。 */
+async function readOrtCache(key: string, want: number): Promise<ArrayBuffer | null> {
+  const cache = await openOrtCache();
+  if (!cache) return null;
+  try {
+    const hit = await cache.match(key);
+    if (!hit) return null;
+    const buf = await hit.arrayBuffer();
+    if (buf.byteLength !== want) {
+      await cache.delete(key);
+      return null;
+    }
+    return buf;
+  } catch {
+    return null;
+  }
+}
+
+async function writeOrtCache(key: string, buf: ArrayBuffer): Promise<void> {
+  const cache = await openOrtCache();
+  if (!cache) return;
+  try {
+    await cache.put(key, new Response(buf, { headers: { 'content-type': 'application/wasm' } }));
+  } catch {
+    // 配额满等情况：缓存写不进去不影响正确性
+  }
+}
+
+/** 取一段，返回这一段以及从 `Content-Range` 解出的总长度。 */
+async function fetchRangeOnce(
+  url: string,
+  start: number,
+  end: number,
+): Promise<{ buf: ArrayBuffer; total: number | null; whole: boolean }> {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), WASM_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      headers: { Range: `bytes=${start}-${end}` },
+      cache: 'no-store',
+      signal: ctl.signal,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const buf = await res.arrayBuffer();
+    const total = Number(/\/(\d+)\s*$/.exec(res.headers.get('content-range') ?? '')?.[1] ?? NaN);
+    return { buf, total: Number.isFinite(total) ? total : null, whole: res.status === 200 };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 分块把整个 wasm 拉下来。
+ *
+ * 为什么不交给 ORT 自己 fetch：**单次长响应在手机上必断**（R17 就是这么来的）。
+ * 26.8 MB 一次拉完在国内链路上是很高的失败率，分块之后断的只是那一块，
+ * 重试代价从「整份重来」变成「重来 2 MB」。顺带还能核对总长度。
+ */
+async function downloadWasm(url: string, want: number): Promise<ArrayBuffer> {
+  const parts: ArrayBuffer[] = [];
+  let start = 0;
+  let total: number | null = null;
+  let chunk = CHUNK_BYTES;
+  let attempts = 0;
+  while (total === null || start < total) {
+    const end = start + chunk - 1;
+    try {
+      const got = await fetchRangeOnce(url, start, end);
+      if (got.buf.byteLength === 0) throw new Error('收到 0 字节');
+      parts.push(got.buf);
+      if (got.total !== null) total = got.total;
+      if (got.whole) {
+        total = got.buf.byteLength;
+      }
+      start += got.buf.byteLength;
+      attempts = 0;
+      // 连着几块都顺，就把块涨回去 —— 不能只降不升（R18 的教训）。
+      if (chunk < CHUNK_BYTES && parts.length % 4 === 0) chunk = Math.min(CHUNK_BYTES, chunk * 2);
+    } catch (err) {
+      attempts += 1;
+      if (attempts >= MAX_ATTEMPTS) {
+        throw new Error(`第 ${Math.floor(start / 1048576)}MB 处连续失败：${err instanceof Error ? err.message : String(err)}`);
+      }
+      chunk = Math.max(MIN_CHUNK_BYTES, Math.floor(chunk / 2));
+    }
+  }
+  const out = new Uint8Array(start);
+  let at = 0;
+  for (const p of parts) {
+    out.set(new Uint8Array(p), at);
+    at += p.byteLength;
+  }
+  if (want > 0 && out.byteLength !== want) {
+    throw new Error(`长度不对：收到 ${out.byteLength}，应当是 ${want}`);
+  }
+  return out.buffer;
 }
 
 /**
  * 加速源此刻可用吗？取一次 `.mjs`（几十 KB）并**核对长度**。
  *
- * 只核长度不核哈希：这是一个版本被钉死的静态文件，长度不符已经能挡住
- * 「镜像上没有这个版本 / 被换成了别的东西」这两类事故，
- * 而真要做哈希校验就得自己下载 26.8 MB 再交给 ORT，反而失去意义。
+ * 只核长度不核哈希：版本被钉死，长度不符已能挡住「镜像上没有这个版本」这一类事故。
+ * wasm 那 26.8 MB 也核对长度，而且是**我们自己下载后再交给 ORT**（见 downloadWasm）。
  */
-async function mirrorUsable(mjsUrl: string): Promise<boolean> {
+async function mjsUsable(url: string, stem: string): Promise<boolean> {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), PROBE_TIMEOUT_MS);
   try {
-    const res = await fetch(mjsUrl, { cache: 'no-store', signal: ctl.signal });
+    const res = await fetch(url, { cache: 'no-store', signal: ctl.signal });
     if (!res.ok) return false;
     const buf = await res.arrayBuffer();
-    const want = PROBE_FILE_BYTES[mjsUrl.split('/').pop() ?? ''];
-    return want === undefined ? buf.byteLength > 0 : buf.byteLength === want;
+    return buf.byteLength === RUNTIME_BYTES[stem].mjs;
   } catch {
     return false;
   } finally {
@@ -168,14 +312,89 @@ async function mirrorUsable(mjsUrl: string): Promise<boolean> {
 }
 
 /**
+ * 按优先级试出一个能用的运行时：先首选的变体，再另一个变体；
+ * 每个变体内部先试 npmmirror，再试自建。
+ *
+ * 返回 `.mjs` 的地址与 wasm 的**字节**；wasm 交给调用方包成 blob。
+ */
+async function pickRuntime(): Promise<{
+  stem: string;
+  source: string;
+  mjs: string;
+  bytes: ArrayBuffer;
+  ms: number;
+  cached: boolean;
+}> {
+  const primary = primaryStem();
+  const stems = primary === ASYNCIFY_STEM ? [ASYNCIFY_STEM, PLAIN_STEM] : [PLAIN_STEM, ASYNCIFY_STEM];
+  const sources = [
+    { label: 'npmmirror', base: ORT_NPM_BASE },
+    { label: '自建', base: `${siteBase()}${ORT_DIR}/` },
+  ];
+  let lastError = '没有可用的源';
+  for (const stem of stems) {
+    for (const src of sources) {
+      const files = filesUnder(src.base, stem);
+      if (!(await mjsUsable(files.mjs, stem))) continue;
+      const startedAt = Date.now();
+      // 缓存键用**自建规范地址**：换源不重下。
+      const key = filesUnder(`${siteBase()}${ORT_DIR}/`, stem).wasm;
+      const cached = await readOrtCache(key, RUNTIME_BYTES[stem].wasm);
+      if (cached) {
+        pushFetchRecord({
+          url: `${src.label}/${stem}.wasm`,
+          status: 200,
+          ok: true,
+          bytes: cached.byteLength,
+          ms: 0,
+          error: null,
+          note: '来自 Cache Storage，没有联网',
+        });
+        return { stem, source: `${src.label}（缓存）`, mjs: files.mjs, bytes: cached, ms: 0, cached: true };
+      }
+      try {
+        const buf = await downloadWasm(files.wasm, RUNTIME_BYTES[stem].wasm);
+        const ms = Date.now() - startedAt;
+        await writeOrtCache(key, buf);
+        pushFetchRecord({
+          url: `${src.label}/${stem}.wasm`,
+          status: 206,
+          ok: true,
+          bytes: buf.byteLength,
+          ms,
+          error: null,
+          note: `${(buf.byteLength / 1048576 / (ms / 1000)).toFixed(2)} MB/s，分块下载`,
+        });
+        return { stem, source: src.label, mjs: files.mjs, bytes: buf, ms, cached: false };
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
+        pushFetchRecord({
+          url: `${src.label}/${stem}.wasm`,
+          status: null,
+          ok: false,
+          bytes: null,
+          ms: Date.now() - startedAt,
+          error: lastError,
+          note: files.wasm,
+        });
+      }
+    }
+  }
+  throw new Error(`ORT 运行时取不到：${lastError}`);
+}
+
+/**
  * 把 ORT 运行时的位置写进 transformers.js 的 env。
- * 必须在任何 `pipeline()` 调用**之前**执行（现在是异步的，要 await）。
+ * 必须在任何 `pipeline()` 调用**之前**执行（异步，必须 await）。
  *
- * 顺序：外置基址（`VITE_ORT_WASM_BASE`）→ npmmirror → 自建。
- * 探测失败只意味着「这次用自建」，不影响正确性 —— 自建的产物一直都在。
+ * 顺序：外置基址（`VITE_ORT_WASM_BASE`）→ 自建缓存 → npmmirror/自建分块下载。
  *
- * 返回实际生效的 `wasmPaths`，供探针把「到底从哪儿取」写进报告 ——
- * 上一次就是因为报告里没有这个信息，才把一个 CDN 问题误判成模型问题。
+ * **wasm 是我们自己下好、核对完长度，再以 blob: 交给 ORT 的。**
+ * 这样做的理由有两个：
+ *   1. 单次 26.8 MB 的长响应在手机上必断，而 ORT 自己 fetch 不会分块也不会重试；
+ *   2. 断在哪儿、下了多少、总长多少，全都能写进报告 —— 上一版这块是完全的黑盒。
+ * `.mjs` 仍然是直接地址（只有几十 KB，且它内部用 `import.meta.url` 推 worker 路径，
+ * 换成 blob 会破坏多线程那条路）。
  */
 export async function configureOrtWasm(
   env: unknown,
@@ -194,16 +413,23 @@ export async function configureOrtWasm(
     return value;
   }
 
-  // 加速源：显式给两个文件名。**不能只给基址字符串** ——
-  // 字符串形式下由 ORT 自己决定文件名，它未必挑 asyncify 那一份。
-  const fast = filesUnder(ORT_NPM_BASE);
-  if (await mirrorUsable(fast.mjs)) {
-    target.backends.onnx.wasm.wasmPaths = fast;
-    return fast;
-  }
-
-  // 兜底：本站自托管。
-  const files = ortRuntimeFiles();
-  target.backends.onnx.wasm.wasmPaths = files;
-  return files;
+  const picked = await pickRuntime();
+  const blob = new Blob([picked.bytes], { type: 'application/wasm' });
+  const wasmUrl = URL.createObjectURL(blob);
+  const paths = { mjs: picked.mjs, wasm: wasmUrl };
+  target.backends.onnx.wasm.wasmPaths = paths;
+  runtimeChoice = {
+    stem: picked.stem,
+    source: picked.source,
+    mjs: picked.mjs,
+    bytes: picked.bytes.byteLength,
+    ms: picked.ms,
+    cached: picked.cached,
+    note: picked.cached
+      ? `${picked.source} · ${(picked.bytes.byteLength / 1048576).toFixed(1)}MB · 来自本机缓存`
+      : `${picked.source} · ${(picked.bytes.byteLength / 1048576).toFixed(1)}MB · ${(
+          picked.bytes.byteLength / 1048576 / Math.max(0.001, picked.ms / 1000)
+        ).toFixed(2)} MB/s`,
+  };
+  return paths;
 }

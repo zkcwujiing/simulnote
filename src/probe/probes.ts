@@ -14,7 +14,7 @@
  */
 
 import { configureModelSource, fetchLogText, forgetSource, localModelPath, resetFetchLog } from '@/lib/modelSource';
-import { configureOrtWasm } from '@/lib/ortEnv';
+import { activeOrtRuntime, configureOrtWasm } from '@/lib/ortEnv';
 
 /**
  * 裸取一个文件，**绕开 transformers.js 和 ORT**，只走浏览器原生 `fetch`。
@@ -98,6 +98,10 @@ export type ProbeState = 'idle' | 'running' | 'pass' | 'warn' | 'fail' | 'skip';
 export function describeWasmPaths(value: string | Record<string, string> | null): string {
   if (value === null) return '⚠️ 无法设置（transformers.js 版本过老），由 ORT 自行决定';
   if (typeof value === 'string') return `外置基址 ${value}`;
+  // wasm 现在是**我们自己下好再包成 blob:** 的，blob 地址里的 UUID 对排障毫无用处。
+  // 真正有用的是「哪一套变体 / 从哪个源 / 多大 / 多快 / 是不是本机缓存」。
+  const active = activeOrtRuntime();
+  if (active) return `${active.stem} · ${active.note}`;
   const mjs = value.mjs ?? '';
   const wasm = value.wasm ?? '';
   const host = (() => {

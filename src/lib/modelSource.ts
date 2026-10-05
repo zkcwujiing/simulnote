@@ -90,6 +90,15 @@ export function resetFetchLog(): void {
   fetchLog = [];
 }
 
+/**
+ * 往抓取日志里塞一条。给 `lib/ortEnv.ts` 用 —— ORT 运行时的下载是**我们自己做的**，
+ * 不走 `instrumentFetch` 包的那条 `env.fetch`，所以得手动记。
+ */
+export function pushFetchRecord(record: FetchRecord): void {
+  fetchLog.push(record);
+  trimLog();
+}
+
 export function fetchLogTail(n = 8): FetchRecord[] {
   return fetchLog.slice(-n);
 }
