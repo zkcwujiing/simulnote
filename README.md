@@ -113,7 +113,7 @@ pnpm verify       # 上面三件事一起跑
 
 ### 还没做的（也是接下来最该做的）
 
-1. **真机验证（最重要）**：`docs/06` 里的 M0 探针 V1–V8 一个都还没跑。**手机能不能跑得动本地模型，目前只有推断，没有数据。** 这是最大的未知。探针页已经写好并且**已经在线**——手机直接打开 <https://zkcwujiing.github.io/simulnote/probe.html>，跑完把报告发回来即可。
+1. **真机验证（进行中）**：2026/10/5 已在 iPhone Safari 上跑出第一批数据 —— **V2（Whisper）通过，RTF 0.217（比实时快 4.6 倍）**；V4（opus-mt）当时失败，根因已定位并修复（见下面事实 3、[`docs/07`](docs/07-风险与对策.md) R17），**待复测**。V1 / V5 / V7 / V8 还没跑。探针页已在线——手机直接打开 <https://zkcwujiing.github.io/simulnote/probe.html>，跑完把报告发回来即可。已有报告见 [`docs/results/`](docs/results/)。
 2. **部署 —— 已完成** ✅：`main` 分支已推到 <https://github.com/zkcwujiing/simulnote>，GitHub Actions 的 `Deploy to GitHub Pages` 跑绿，站点上线于 <https://zkcwujiing.github.io/simulnote/>。
    > 唯一一个必须**手动做一次**的动作：仓库 **Settings → Pages → Source 选 "GitHub Actions"**。
    > 这一步没做的话，流水线的 Install / Fetch models / Build 全绿，只在最后的 `configure-pages` 红掉，
@@ -122,10 +122,11 @@ pnpm verify       # 上面三件事一起跑
    > Cloudflare Pages 那份 workflow 仍然保留但改成手动触发，理由见 [`docs/08-零成本方案与分享方式.md`](docs/08-零成本方案与分享方式.md)。
 3. **手机端体验打磨**：横竖屏、锁屏中断恢复、长时间会话的内存回收。
 
-### 四个必须知道的事实
+### 几个必须知道的事实
 
 1. **模型自己托管，首访要下 160 MB。** Hugging Face CDN 在国内实测 0/3 不通（DNS 污染 + SNI 阻断），所以 `scripts/fetch-models.mjs` 在**构建期**把 24 个文件拉到 `public/models/` 随站点发布，运行时 `allowRemoteModels=false`，**不访问任何外部服务**。好处是「朋友能不能用」不再取决于他能否连上 HF；代价是站点变成 200 MB，GitHub Pages 的 100 GB/月带宽 ≈ **500 次完整首访/月**，这是现在要盯的指标。复访走 Cache Storage，不再花流量。
 2. **ONNX Runtime 的运行时也必须自托管 —— 这一条是真机实测才发现的（提交 `3d40184`）。** transformers.js 的产物里写着：只要 `env.backends.onnx.wasm.wasmPaths` 为空，它就把 ORT 的 `.mjs` 胶水和 26.8 MB 的 wasm 指向一个**第三方静态资源 CDN**。国内手机上那个 CDN 连不上，`pipeline()` 抛 `TypeError: Load failed` —— 看起来像「模型加载失败」，实际是 CDN 不通。现在 `src/lib/ortEnv.ts` 的 `configureOrtWasm()` **无条件**把它指到本站 `/<base>/ort/`，`vite.config.ts` 的 `ortRuntime()` 插件负责把那两对文件拷进产物。**`pnpm lint:cost` 现在会扫产物和调用点，防止这个回归再次发生。**
-3. **Cloudflare Pages 有 25 MiB 单文件上限，而且现在有 4 个文件超限。** 除了 26.8 MB 的 `ort-wasm-simd-threaded.asyncify.wasm`（这个能外置成本仓库的 Release 资产），还有 3 个模型 `.onnx`（29 / 50 / 57 MB）——**它们没有外置方案**，因为外置就等于回到「运行时从第三方 CDN 取权重」。**所以 GitHub Pages 是唯一无损路线。**
-4. **Chrome 内置翻译 API 不支持手机**（只支持桌面 Chrome 138+ / Edge 148+，且要求 16GB 内存）。所以手机上只能走本地模型或浏览器原生识别 —— 这正是 `docs/03` 设计四层降级链的原因。另外 Chrome 的原生识别在**国内同样不通**（音频要发往 Google 服务器）。经真机实测，**手机浏览器一律没有原生识别**，所以这一层在移动端实际上不存在。
-5. **小模型翻译数字不可靠**（hayamimi 官方 Limitations 原文："numeric values are not reliably preserved"）。本项目的对策是**数字完全绕开翻译模型**，从英文原文按规则抽取并生成对照表。
+3. **GitHub Pages 会给 `.onnx` 加 gzip，而手机上单个大响应取不完 —— 所以 `.onnx` 一律走 `Range` 分块。** 50.45 MB 的 opus 编码器线上 `Content-Length` 只有 37,142,901 且带 `Content-Encoding: gzip`，浏览器要在一次长连接里收完再解压；裸取探测**只收到 4.5 MB 就断**。而**带 `Range` 的请求服务端不压缩**，返回未压缩的字节区间和真实总长度。现在 `src/lib/modelSource.ts` 把 `.onnx` 按 2 MB 分块取回、拼成 Blob、**核对总长度**后自己写入 Cache Storage（`simulnote-models-v1`）。同时 `env.useBrowserCache` 被**关掉**——库自带的缓存命中时不校验长度，一次断线留下的半截文件会被永久命中，症状是「清了缓存就好、不清就永远坏」。详见 [`docs/07-风险与对策.md`](docs/07-风险与对策.md) 的 R17。
+4. **Cloudflare Pages 有 25 MiB 单文件上限，而且现在有 4 个文件超限。** 除了 26.8 MB 的 `ort-wasm-simd-threaded.asyncify.wasm`（这个能外置成本仓库的 Release 资产），还有 3 个模型 `.onnx`（29 / 50 / 57 MB）——**它们没有外置方案**，因为外置就等于回到「运行时从第三方 CDN 取权重」。**所以 GitHub Pages 是唯一无损路线。**
+5. **Chrome 内置翻译 API 不支持手机**（只支持桌面 Chrome 138+ / Edge 148+，且要求 16GB 内存）。所以手机上只能走本地模型或浏览器原生识别 —— 这正是 `docs/03` 设计四层降级链的原因。另外 Chrome 的原生识别在**国内同样不通**（音频要发往 Google 服务器）。经真机实测，**手机浏览器一律没有原生识别**，所以这一层在移动端实际上不存在。
+6. **小模型翻译数字不可靠**（hayamimi 官方 Limitations 原文："numeric values are not reliably preserved"）。本项目的对策是**数字完全绕开翻译模型**，从英文原文按规则抽取并生成对照表。

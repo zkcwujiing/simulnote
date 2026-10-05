@@ -339,7 +339,7 @@ export default function ProbeApp() {
         title: `本地翻译模型（${mtModel}）`,
         state: r.error ? 'fail' : (r.meanMs ?? 9999) <= 800 ? 'pass' : 'warn',
         verdict: r.error
-          ? '跑不起来 —— 把下面的报错整段复制回来，需要换模型 id。'
+          ? '跑不起来 —— 把下面的报错整段复制回来。先看「库发出的网络请求」里失败的是哪一条。'
           : `可用。平均 ${fmtMs(r.meanMs)}/句（约 ${r.throughputPerSec} 句/秒）。中英对照请人眼判断质量。`,
         error: r.error,
         details: {
@@ -349,7 +349,10 @@ export default function ProbeApp() {
           '吞吐（句/秒）': r.throughputPerSec ?? '—',
           '单句耗时（ms）': r.perSentenceMs.join(', ') || '—',
           'ORT 运行时来源': r.ortRuntime ?? '—',
-          '裸取诊断（绕开库直取编码器）': r.rawProbe ?? '（没跑，说明加载成功）',
+          // 这一行是**对照组**：故意用最朴素的一次性 fetch 把整个文件拿下来。
+          // 它在手机上本来就是断的（见 docs/07 R17），留着是为了对照「分块下载」确实修好了什么。
+          // 所以它报失败、而上面「库发出的网络请求」报成功，是**预期结果**，不是矛盾。
+          '裸取诊断（对照组：一次性整取，预期会断）': r.rawProbe ?? '（没跑，说明加载成功）',
           '库发出的网络请求（最近 8 条）': r.fetchLog ?? '—',
           '产物样例（空字符串通常意味着需要用带语言前缀的模型）': r.outputs[0] ?? '—',
         },
