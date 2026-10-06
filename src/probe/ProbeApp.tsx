@@ -7,6 +7,9 @@ import {
   fmtMs,
   MT_SAMPLES,
   benchOrtRuntime,
+  benchMemoryFull,
+  clearMemoryPartial,
+  readMemoryPartial,
   probeCacheWrite,
   probeDevice,
   probeExtractive,
@@ -15,7 +18,6 @@ import {
   probeStorage,
   probeTranslatorApi,
   stateLabel,
-  stressMemory,
   toMarkdownReport,
   type ProbeResult,
   type ProbeState,
@@ -95,6 +97,9 @@ export default function ProbeApp() {
   const [mtModel, setMtModel] = useState('Xenova/opus-mt-en-zh');
   const [copied, setCopied] = useState(false);
   const [cacheMsg, setCacheMsg] = useState<string | null>(null);
+  // 上一轮内存探针的留痕：第一段会把内存推到极限，被系统杀掉标签页时
+  // 只能靠 localStorage 里那几步把数字带回来。
+  const [v8Partial, setV8Partial] = useState(() => readMemoryPartial());
   const reportRef = useRef<HTMLTextAreaElement>(null);
 
   const log = useCallback((line: string) => {
@@ -210,35 +215,84 @@ export default function ProbeApp() {
       };
     });
 
-  // ── V8 内存压力 ─────────────────────────────────────────
+  // ── V8 内存探针（两段）────────────────────────────────────
   const runMemory = () =>
-    run('V8', '内存压力测试（能要到多少内存）', async () => {
-      log('开始内存压力测试，手机上有可能被杀标签页…');
-      const r = await stressMemory(3072, 64, (mb) => {
-        if (mb % 512 === 0) log(`已占用 ${mb} MB…`);
+    run('V8', '内存探针（设备上限 + 两个模型驻留后的余量）', async () => {
+      log('内存探针：第一段量设备上限，第二段把 ASR 与 MT 同时驻留再量余量…');
+      clearMemoryPartial();
+      setV8Partial(null);
+      const dtype = whisperDevice === 'webgpu' ? 'fp32' : 'q8';
+      const r = await benchMemoryFull({
+        asrModelId: whisperModel,
+        mtModelId: mtModel,
+        device: whisperDevice,
+        dtype,
+        onNote: log,
       });
-      log(`内存压力测试结束：拿到 ${r.achievedMb} MB`);
-      const mobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+      setV8Partial(readMemoryPartial());
+
+      const ceilingMb = r.ceiling.achievedMb;
+      const res = r.resident;
+      const headroom = res?.headroomMb ?? null;
+      log(`内存探针结束：上限 ${ceilingMb} MB，两个模型驻留后余量 ${headroom ?? '—'} MB`);
+
       const need = 700; // 手机档「ASR + MT」两个 q8 模型的粗估常驻需求
-      const state: ProbeState = r.achievedMb >= 1600 ? 'pass' : r.achievedMb >= need ? 'warn' : 'fail';
+      const bothLoaded = res !== null && res.asrError === null && res.mtError === null;
+      const state: ProbeState =
+        bothLoaded && headroom !== null
+          ? headroom >= 256
+            ? 'pass'
+            : headroom >= 128
+              ? 'warn'
+              : 'fail'
+          : ceilingMb >= need
+            ? 'warn'
+            : 'fail';
+
+      const verdict = bothLoaded && headroom !== null
+        ? headroom >= 256
+          ? `两个模型同时驻留后还剩 ${headroom} MB ——「边听边译」有余量。`
+          : headroom >= 128
+            ? `两个模型同时驻留后只剩 ${headroom} MB —— 能跑，但**不该再加任何常驻模型**（本地 LLM、第二语言、长会话都要省着用）。`
+            : `两个模型同时驻留后只剩 ${headroom} MB —— 余量太薄，「ASR + MT」同时跑有被系统杀标签页的风险。`
+        : ceilingMb >= need
+          ? `空设备能拿 ${ceilingMb} MB，但第二段没能跑起来（${res?.asrError ?? res?.mtError ?? r.residentError ?? '原因不明'}），「两个模型同时驻留」还没有凭据。`
+          : `空设备只拿到 ${ceilingMb} MB，低于 ${need} MB 的安全线 —— 这台设备必须走「零下载 / 服务器识别」档。`;
+
+      const pct = (v: number | null | undefined) => (v === null || v === undefined ? '—' : `${v} ms`);
+      const details: Record<string, string> = {
+        '第一段 · 空设备上限': `${ceilingMb} MB（步长 ${r.ceiling.stepMb} MB；首次失败 ${
+          r.ceiling.failedAtMb === null ? '未失败' : `${r.ceiling.failedAtMb} MB`
+        }）`,
+        '第一段 · 耗时（秒）': (r.ceiling.durationMs / 1000).toFixed(1),
+        '第二段 · ASR 驻留': res?.asrError ? `失败：${res.asrError}` : pct(res?.asrMs),
+        '第二段 · MT 驻留': res?.mtError ? `失败：${res.mtError}` : pct(res?.mtMs),
+        '第二段 · 两个模型都驻留后的余量': headroom === null ? '没跑成' : `${headroom} MB`,
+        '第二段 · 是否到顶就停': res
+          ? res.headroomStoppedEarly
+            ? `是（到 ${res.headroomCapMb} MB 上限主动停，没往死里推）`
+            : `否，在 ${res.headroomFailure ?? '未知位置'} 处真的失败了`
+          : '—',
+        '堆占用（加载前 → 模型就绪）':
+          res && res.heapUsedBeforeMb !== null
+            ? `${res.heapUsedBeforeMb} → ${res.heapUsedLoadedMb} MB（内核上限 ${res.heapLimitMb} MB）`
+            : '这个内核不暴露 performance.memory（iOS Safari 就是这样）',
+        'ASR 模型': whisperModel,
+        'MT 模型': mtModel,
+        '推理后端 / dtype': `${whisperDevice} / ${dtype}`,
+        是否移动端: String(/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)),
+        '第一段失败信息': r.ceiling.failureMessage ?? '无',
+        备注: [...(res?.notes ?? []), r.residentError ? `第二段异常：${r.residentError}` : '']
+          .filter(Boolean)
+          .join(' '),
+      };
+
       return {
         id: 'V8',
-        title: '内存压力测试（能要到多少内存）',
+        title: '内存探针（设备上限 + 两个模型驻留后的余量）',
         state,
-        verdict:
-          r.achievedMb >= 1600
-            ? `能拿到 ${r.achievedMb} MB，跑「ASR + MT」两个 q8 模型有余量。`
-            : r.achievedMb >= need
-              ? `只能拿到 ${r.achievedMb} MB，够跑「ASR + MT」但**不该再加本地 LLM**。`
-              : `只拿到 ${r.achievedMb} MB，低于 ${need} MB 的安全线 —— 这台设备必须走「零下载 / 服务器识别」档。`,
-        details: {
-          累计成功分配并写入: `${r.achievedMb} MB（步长 ${r.stepMb} MB）`,
-          '首次失败的档位': r.failedAtMb === null ? `在 ${r.achievedMb} MB 内没有失败` : `${r.failedAtMb} MB`,
-          '失败信息': r.failureMessage ?? '无',
-          '耗时（秒）': (r.durationMs / 1000).toFixed(1),
-          是否移动端: mobile,
-          判定安全线: `${need} MB`,
-        },
+        verdict,
+        details,
       };
     });
 
@@ -467,12 +521,41 @@ export default function ProbeApp() {
         </Section>
 
         <Section
-          title="③ V8 · 内存压力测试（最关键的一个数字）"
-          hint="决定手机端到底能跑几个模型：拿到的内存越多，能做的档位越高。"
+          title="③ V8 · 内存探针（最关键的一个数字）"
+          hint="分两段：先量这台设备最多能要到多少内存，再把 ASR 与 MT 两个模型同时驻留、量还剩多少余量。第二段才是「边听边译」能不能做的直接凭据。"
         >
           <button className={BTN_DANGER} disabled={busy !== null} onClick={() => void runMemory()}>
-            {busy === 'V8' ? '运行中…' : '开始内存压力测试'}
+            {busy === 'V8' ? '运行中…' : '开始内存探针（两段）'}
           </button>
+          <p className="mt-2 text-xs leading-relaxed text-amber-300/90">
+            ⚠️ 第一段会故意把内存写到写不进去为止，手机上**有可能被系统直接杀掉标签页**。
+            每一步都会先存进本机 localStorage，真被杀了、重新打开这一页，下边也能看到跑到了哪一步。
+          </p>
+          {v8Partial && (
+            <div className="mt-3 rounded-lg border border-amber-400/50 bg-amber-400/10 p-3 text-xs leading-relaxed text-amber-200">
+              <div className="font-medium">上一次内存探针的留痕（{new Date(v8Partial.at).toLocaleString('zh-CN')}）</div>
+              <div className="mt-1">
+                阶段：{v8Partial.stage} · 空设备上限：
+                {v8Partial.ceilingMb === null ? '未记录' : `${v8Partial.ceilingMb} MB`} · 两个模型驻留后余量：
+                {v8Partial.headroomMb === null ? '未记录' : `${v8Partial.headroomMb} MB`}
+              </div>
+              {v8Partial.stage !== 'done' && (
+                <div className="mt-1">
+                  这一轮**没有跑完**（多半是标签页被系统杀掉了）—— 上边的数字就是它死之前拿到的最后一步。
+                </div>
+              )}
+              <button
+                className={`${BTN_GHOST} mt-2`}
+                disabled={busy !== null}
+                onClick={() => {
+                  clearMemoryPartial();
+                  setV8Partial(null);
+                }}
+              >
+                清掉这条留痕
+              </button>
+            </div>
+          )}
           {results.V8 && <ResultCard r={results.V8} />}
         </Section>
 

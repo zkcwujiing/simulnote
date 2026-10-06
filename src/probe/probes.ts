@@ -458,46 +458,312 @@ export async function stressMemory(
   stepMb = 64,
   onStep?: (achievedMb: number) => void,
 ): Promise<MemoryStressResult> {
-  const blocks: Float32Array[] = [];
   const started = performance.now();
+  const r = await allocUntilFailure(stepMb, maxMb, onStep);
+  // 一定要还回去，否则后面的模型探针跑不动
+  r.blocks.length = 0;
+
+  // 等一下让 GC 有机会回收，再看一次堆占用
+  await new Promise((res) => setTimeout(res, 300));
+
+  return {
+    stepMb,
+    achievedMb: r.achievedMb,
+    failedAtMb: r.failedAtMb,
+    failureMessage: r.failureMessage,
+    durationMs: round(performance.now() - started, 0),
+    releasedOk: true,
+  };
+}
+
+/** 逐块分配**并真正写入**，直到失败或到达上限。两段探针共用这段逻辑。 */
+async function allocUntilFailure(
+  stepMb: number,
+  maxMb: number,
+  onStep?: (achievedMb: number) => void,
+): Promise<{
+  blocks: Float32Array[];
+  achievedMb: number;
+  failedAtMb: number | null;
+  failureMessage: string | null;
+}> {
+  const blocks: Float32Array[] = [];
   let achieved = 0;
   let failedAt: number | null = null;
   let failureMessage: string | null = null;
 
-  try {
-    for (let m = stepMb; m <= maxMb; m += stepMb) {
-      let block: Float32Array | null = null;
-      try {
-        block = new Float32Array((stepMb * MB) / 4);
-        // 强制物理提交（分页写入，避免被优化掉）
-        block.fill(1);
-      } catch (err) {
-        failedAt = m;
-        failureMessage = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
-        break;
-      }
-      blocks.push(block);
-      achieved = m;
-      onStep?.(achieved);
-      // 让出主线程，否则手机上整个界面会假死
-      await new Promise((r) => setTimeout(r, 0));
+  for (let m = stepMb; m <= maxMb; m += stepMb) {
+    let block: Float32Array | null = null;
+    try {
+      block = new Float32Array((stepMb * MB) / 4);
+      // 强制物理提交（分页写入，避免被优化掉）
+      block.fill(1);
+    } catch (err) {
+      failedAt = m;
+      failureMessage = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+      break;
     }
-  } finally {
-    // 一定要还回去，否则后面的模型探针跑不动
-    blocks.length = 0;
+    blocks.push(block);
+    achieved = m;
+    onStep?.(achieved);
+    // 让出主线程，否则手机上整个界面会假死
+    await new Promise((r) => setTimeout(r, 0));
   }
 
-  // 等一下让 GC 有机会回收，再看一次堆占用
-  await new Promise((r) => setTimeout(r, 300));
+  return { blocks, achievedMb: achieved, failedAtMb: failedAt, failureMessage };
+}
+
+// ─────────────────────────────────────────────────────────────
+// V8 第二段 —— 两个模型**同时驻留**之后还剩多少内存
+//
+// 第一段（stressMemory）量的是「一台空设备最多能要到多少」，那个数字单独
+// 回答不了 R1 真正要问的问题：whisper（ASR）与 opus-mt（MT）**同时**驻留
+// 时还剩多少余量。第二段就把这两条 pipeline 都建起来、都留在内存里，然后
+// 再逐块写到失败 —— 得到的才是「边听边译」这个形态可用不可用的直接凭据。
+// ─────────────────────────────────────────────────────────────
+
+export interface MemoryResidentResult {
+  asrModelId: string;
+  mtModelId: string;
+  asrMs: number | null;
+  mtMs: number | null;
+  asrError: string | null;
+  mtError: string | null;
+  heapLimitMb: number | null;
+  heapUsedBeforeMb: number | null;
+  heapUsedLoadedMb: number | null;
+  /** 两个模型都驻留后，还能真正写入的 MB */
+  headroomMb: number;
+  /** 这次分配的上限（第一段上限的 95%，并封顶 2048 MB） */
+  headroomCapMb: number;
+  /** true = 到了上限就主动停，没把设备真的逼到失败 */
+  headroomStoppedEarly: boolean;
+  headroomFailure: string | null;
+  headroomMs: number;
+  disposedOk: boolean;
+  notes: string[];
+}
+
+export async function benchMemoryBudget(opts: {
+  asrModelId: string;
+  mtModelId: string;
+  device: string;
+  dtype: string;
+  /** 第一段量到的上限；没跑第一段就传 null */
+  ceilingMb: number | null;
+  onNote?: (note: string) => void;
+  onStep?: (achievedMb: number) => void;
+}): Promise<MemoryResidentResult> {
+  const note = opts.onNote ?? (() => {});
+  const notes: string[] = [];
+  const perf = performance as MemoryPerformance;
+  const heapUsed = () => (perf.memory ? round(perf.memory.usedJSHeapSize / MB) : null);
+  const heapLimit = () => (perf.memory ? round(perf.memory.jsHeapSizeLimit / MB) : null);
+  if (!perf.memory) {
+    notes.push(
+      '这个内核不暴露 performance.memory（iOS Safari 就是这样），所以看不到堆占用；' +
+        '下边那个「余量」仍然有效 —— 它是真的写进去了才算数。',
+    );
+  }
+  notes.push(
+    '两个模型同时驻留是这个探针的重点：单跑一个都不成问题，' +
+      '「边听边译」要的是它们**同时**在内存里。',
+  );
+
+  const mod = await import('@huggingface/transformers');
+  const { pipeline, env } = mod;
+  configureModelSource(env);
+  await configureOrtWasm(env);
+  forgetSource();
+
+  const before = heapUsed();
+  const common = { device: opts.device, dtype: opts.dtype } as never;
+  let asr: unknown = null;
+  let mt: unknown = null;
+  let asrMs: number | null = null;
+  let mtMs: number | null = null;
+  let asrError: string | null = null;
+  let mtError: string | null = null;
+
+  const t0 = performance.now();
+  try {
+    asr = await pipeline('automatic-speech-recognition', opts.asrModelId, common);
+    asrMs = round(performance.now() - t0, 0);
+    note(`ASR 已驻留（${asrMs} ms）`);
+  } catch (err) {
+    asrError = errText(err);
+    note(`ASR 没能驻留：${asrError}`);
+  }
+
+  const t1 = performance.now();
+  try {
+    mt = await pipeline('translation', opts.mtModelId, common);
+    mtMs = round(performance.now() - t1, 0);
+    note(`MT 已驻留（${mtMs} ms）`);
+  } catch (err) {
+    mtError = errText(err);
+    note(`MT 没能驻留：${mtError}`);
+  }
+
+  const loaded = heapUsed();
+  if (before !== null && loaded !== null) {
+    note(`堆占用：加载前 ${before} MB → 两个模型就绪 ${loaded} MB`);
+  }
+
+  const cap = Math.min(
+    2048,
+    opts.ceilingMb === null ? 1024 : Math.max(256, Math.floor(opts.ceilingMb * 0.95)),
+  );
+  notes.push(
+    opts.ceilingMb === null
+      ? `没跑第一段，本次分配上限按默认 ${cap} MB 封顶。`
+      : `分配上限取第一段 ${opts.ceilingMb} MB 的 95%，即 ${cap} MB —— 到点就停，不再往死里推。`,
+  );
+  note(`开始分配（上限 ${cap} MB）…`);
+
+  const allocStart = performance.now();
+  const alloc = await allocUntilFailure(64, cap, opts.onStep);
+  const headroomMs = round(performance.now() - allocStart, 0);
+  alloc.blocks.length = 0;
+
+  let disposedOk = true;
+  for (const p of [asr, mt]) {
+    if (!p) continue;
+    try {
+      await (p as { dispose?: () => Promise<void> }).dispose?.();
+    } catch {
+      disposedOk = false;
+    }
+  }
+  await new Promise((res) => setTimeout(res, 300));
 
   return {
-    stepMb,
-    achievedMb: achieved,
-    failedAtMb: failedAt,
-    failureMessage,
-    durationMs: round(performance.now() - started, 0),
-    releasedOk: true,
+    asrModelId: opts.asrModelId,
+    mtModelId: opts.mtModelId,
+    asrMs,
+    mtMs,
+    asrError,
+    mtError,
+    heapLimitMb: heapLimit(),
+    heapUsedBeforeMb: before,
+    heapUsedLoadedMb: loaded,
+    headroomMb: alloc.achievedMb,
+    headroomCapMb: cap,
+    headroomStoppedEarly: alloc.failedAtMb === null,
+    headroomFailure: alloc.failureMessage,
+    headroomMs,
+    disposedOk,
+    notes,
   };
+}
+
+// ─────────────────────────────────────────────────────────────
+// V8 的逐步留痕
+//
+// 第一段会把内存推到极限，手机上**有可能被系统直接杀掉标签页**。跑之前先
+// 把每步结果写进 localStorage：真的被杀掉，重新打开探针页也能看到最后
+// 一个成功的数字，不至于白跑一趟。
+// ─────────────────────────────────────────────────────────────
+
+const MEMORY_PARTIAL_KEY = 'simulnote.v8.partial';
+
+export interface MemoryPartial {
+  stage: 'ceiling' | 'ceiling-done' | 'headroom' | 'done';
+  ceilingMb: number | null;
+  headroomMb: number | null;
+  at: number;
+}
+
+export function readMemoryPartial(): MemoryPartial | null {
+  try {
+    const raw = localStorage.getItem(MEMORY_PARTIAL_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as MemoryPartial;
+    return typeof parsed?.stage === 'string' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export function clearMemoryPartial(): void {
+  try {
+    localStorage.removeItem(MEMORY_PARTIAL_KEY);
+  } catch {
+    /* 隐私模式下写不了，忽略 */
+  }
+}
+
+function saveMemoryPartial(rec: MemoryPartial): void {
+  try {
+    localStorage.setItem(MEMORY_PARTIAL_KEY, JSON.stringify(rec));
+  } catch {
+    /* 同上 */
+  }
+}
+
+export interface MemoryFullResult {
+  ceiling: MemoryStressResult;
+  resident: MemoryResidentResult | null;
+  /** 第二段没能跑起来的原因（目前只会是「抛了异常」） */
+  residentError: string | null;
+}
+
+/** V8 的完整两段。逐步留痕，中途被杀也能拿回一半数字。 */
+export async function benchMemoryFull(opts: {
+  asrModelId: string;
+  mtModelId: string;
+  device: string;
+  dtype: string;
+  onNote?: (note: string) => void;
+}): Promise<MemoryFullResult> {
+  const note = opts.onNote ?? (() => {});
+  clearMemoryPartial();
+
+  note('第一段：从 64 MB 起逐块写入，直到写不进去为止…');
+  const ceiling = await stressMemory(3072, 64, (mb) => {
+    if (mb % 512 === 0) note(`已占用 ${mb} MB…`);
+    saveMemoryPartial({ stage: 'ceiling', ceilingMb: mb, headroomMb: null, at: Date.now() });
+  });
+  note(`第一段结束：拿到 ${ceiling.achievedMb} MB`);
+  saveMemoryPartial({
+    stage: 'ceiling-done',
+    ceilingMb: ceiling.achievedMb,
+    headroomMb: null,
+    at: Date.now(),
+  });
+
+  note('第二段：把 ASR 与 MT 两个模型同时驻留，再量剩余余量…');
+  try {
+    const resident = await benchMemoryBudget({
+      asrModelId: opts.asrModelId,
+      mtModelId: opts.mtModelId,
+      device: opts.device,
+      dtype: opts.dtype,
+      ceilingMb: ceiling.achievedMb,
+      onNote: note,
+      onStep: (mb) => {
+        saveMemoryPartial({
+          stage: 'headroom',
+          ceilingMb: ceiling.achievedMb,
+          headroomMb: mb,
+          at: Date.now(),
+        });
+      },
+    });
+    saveMemoryPartial({
+      stage: 'done',
+      ceilingMb: ceiling.achievedMb,
+      headroomMb: resident.headroomMb,
+      at: Date.now(),
+    });
+    return { ceiling, resident, residentError: null };
+  } catch (err) {
+    return { ceiling, resident: null, residentError: errText(err) };
+  }
+}
+
+function errText(err: unknown): string {
+  return err instanceof Error ? `${err.name}: ${err.message}` : String(err);
 }
 
 export interface StorageInfo {
