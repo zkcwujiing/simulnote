@@ -20,7 +20,7 @@ import {
   type ProbeResult,
   type ProbeState,
 } from './probes';
-import { activeSource, clearModelCache, forgetSource, sourceUrlsForTest } from '@/lib/modelSource';
+import { activeSource, clearModelCache, encoderRelFor, forgetSource, sourceUrlsForTest } from '@/lib/modelSource';
 
 const CARD = 'rounded-2xl border border-slate-700/70 bg-slate-900/70 p-4';
 const BTN =
@@ -352,8 +352,9 @@ export default function ProbeApp() {
           RTF: r.rtf,
           'ORT 运行时来源': r.ortRuntime ?? '—',
           '模型来源（自动测速）': activeSource()?.note ?? '—',
-          '模型地址（两个源，供核对）': sourceUrlsForTest().join('  |  '),
+          '模型地址（所有源，供核对）': sourceUrlsForTest(encoderRelFor(whisperModel)).join('  |  '),
           '识别输出（合成音频，仅证明链路通，不代表质量）': r.text?.slice(0, 200) ?? '—',
+          '库发出的网络请求（最近 8 条）': r.fetchLog ?? '—',
         },
       };
     });
@@ -389,7 +390,7 @@ export default function ProbeApp() {
           '单句耗时（ms）': r.perSentenceMs.join(', ') || '—',
           'ORT 运行时来源': r.ortRuntime ?? '—',
           '模型来源（自动测速）': activeSource()?.note ?? '—',
-          '模型地址（两个源，供核对）': sourceUrlsForTest().join('  |  '),
+          '模型地址（所有源，供核对）': sourceUrlsForTest(encoderRelFor(mtModel)).join('  |  '),
           // 这一行是**对照组**：故意用最朴素的一次性 fetch 把整个文件拿下来，
           // 绕开 transformers 与 ORT。它报成功还是失败，都能说明「网络这一层」的状态：
           // 失败 = 这条源站确实撑不住长响应；成功 = 就是库或缓存的问题。

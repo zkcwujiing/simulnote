@@ -682,6 +682,12 @@ export interface ModelTimingResult {
   text: string | null;
   /** ORT 运行时实际从哪儿取（人话）。用来一眼看出有没有被送去第三方 CDN。 */
   ortRuntime: string | null;
+  /**
+   * 库发出的网络请求（最近 8 条）。
+   * **成功与失败都要带上** —— 之前只在 catch 里填，于是「通过了但慢」的报告里
+   * 一个请求记录都没有，谁也不知道它到底从哪个源、用几路下载下来的。
+   */
+  fetchLog: string | null;
   error?: string;
 }
 
@@ -730,6 +736,7 @@ export async function benchWhisper(opts: WhisperBenchOptions): Promise<ModelTimi
     inferMs: null,
     text: null,
     ortRuntime: null,
+    fetchLog: null,
   };
   try {
     opts.onNote?.('动态导入 @huggingface/transformers …');
@@ -793,9 +800,11 @@ export async function benchWhisper(opts: WhisperBenchOptions): Promise<ModelTimi
     result.rtf = round((result.inferMs ?? 0) / 1000 / opts.audioSec, 3);
 
     (transcriber as unknown as { dispose?: () => Promise<void> }).dispose?.();
+    result.fetchLog = fetchLogText();
     return result;
   } catch (err) {
     result.error = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    result.fetchLog = fetchLogText();
     return result;
   }
 }
@@ -886,6 +895,7 @@ export async function benchMt(opts: {
     result.meanMs = round(sum / result.perSentenceMs.length, 0);
     result.throughputPerSec = round(1000 / (result.meanMs || 1), 1);
     (translator as unknown as { dispose?: () => Promise<void> }).dispose?.();
+    result.fetchLog = fetchLogText();
     return result;
   } catch (err) {
     result.error = err instanceof Error ? `${err.name}: ${err.message}` : String(err);

@@ -279,13 +279,21 @@ async function probeSource(source: ModelSource): Promise<number> {
 }
 
 /**
- * 排障用：把某个模型文件在两个源上的**确切地址**列出来，给探针页显示。
+ * 排障用：把某个模型文件在所有源上的**确切地址**列出来，给探针页显示。
  * 加它的原因就是上面那次 404 —— 报告上只有一个「选 自建」的结论，
  * 看不出镜像到底是连不上、404 了、还是慢，只能靠猜。
+ *
+ * **`rel` 必须传「当前这个模型」的路径。** 2026/10/6 的报告里，V4（opus-mt-en-zh）
+ * 那一行显示的是 **whisper** 的地址 —— 因为这里默认取了测速用的 `PROBE_REL`。
+ * 核对地址的人会以为自己看的是 V4，实际看的是 V2，**比没有这一行更糟**。
  */
-export function sourceUrlsForTest(): string[] {
-  const rel = PROBE_REL;
+export function sourceUrlsForTest(rel: string = PROBE_REL): string[] {
   return allSources().map((s) => `${s.label}: ${sourceUrl(s, rel)}`);
+}
+
+/** 探针页要按模型列出地址，这里给出统一的重编码器相对路径。 */
+export function encoderRelFor(modelId: string): string {
+  return `${modelId}/onnx/encoder_model_quantized.onnx`;
 }
 
 /** 读上一次的选择（1 小时内有效），避免每次打开都重测、白花 512 KB 流量。 */
