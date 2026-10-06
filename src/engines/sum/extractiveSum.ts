@@ -16,7 +16,7 @@
 
 import type { FinalSegment, Keyword, SummaryResult } from '@/types';
 import type { SumEngine, SummarizeInput } from '../types';
-import { DECISION_CUES, ACTION_CUES, GLOSSARY, STOPWORDS } from '@/lib/glossary';
+import { DECISION_CUES, ACTION_CUES, GLOSSARY, STOPWORDS, LEADING_FILLER } from '@/lib/glossary';
 import { extractFacts } from './facts';
 import { backfillNumbers, type BackfillEdit } from './backfill';
 import { hierarchicalTextRank, mmrSelect, textRank, tokenize } from './textRank';
@@ -162,6 +162,52 @@ function splitInline(text: string): string[] {
 }
 
 /**
+ * 「一句话值不值得进纪要」的修正系数，乘在 TextRank 分数上。
+ *
+ * 为什么必须有这一层：TextRank 衡量的是**中心度**，不是**信息量**。
+ * 中心度和信息量在会议记录里经常是背离的 ——
+ *   `Let me walk through where we are on the quarter and then we have three
+ *    decisions to make.`
+ *   `Also please read the incident review before the meeting, not during it.`
+ * 这两句满是 meeting / review / quarter / decision 这类高频词，句图里连接数最高，
+ * 于是稳居榜首；但它们一个字都不该出现在纪要里。反过来，
+ *   `Latency dropped from 820 milliseconds to 140 milliseconds.`
+ * 只出现一次，中心度很低，却是不折不扣的要点。
+ *
+ * V6 基准（`docs/results/V6.md`）就是被这两句拉低的：precision@5 只有 60%。
+ * 修正系数不是为了让基准好看，而是因为「串场与客套不是要点」这条判断
+ * 与语料无关，它在任何一场会议上都成立。
+ */
+function sentenceWeight(text: string): number {
+  const t = text.trim();
+  const lower = t.toLowerCase();
+  let w = 1;
+
+  // 1) 开场白 / 串场 / 客套：中心度最高、信息量最低的一类
+  if (LEADING_FILLER.some((re) => re.test(t))) w *= 0.55;
+  if (
+    /^(let me|let us|let's|thanks|thank you|please|also please|good morning|good afternoon|good evening|okay|alright|two more things|one more thing|before we close|that is everything|that's everything|i want to|i just want)\b/i.test(
+      t,
+    )
+  ) {
+    w *= 0.6;
+  }
+
+  // 2) 太短的句子通常扛不住一个要点
+  if (t.split(/\s+/).length < 6) w *= 0.7;
+
+  // 3) 带具体数量的句子几乎必然是「事实」，而事实正是纪要要留的东西
+  if (/\d/.test(t) || /\b(percent|million|billion|thousand|dozen)\b/i.test(t)) w *= 1.25;
+
+  // 4) 带「拍板了 / 还要做」线索的句子优先
+  if (DECISION_CUES.some((c) => lower.includes(c)) || ACTION_CUES.some((c) => lower.includes(c))) {
+    w *= 1.15;
+  }
+
+  return w;
+}
+
+/**
  * 句级 TextRank → 段级聚合 → MMR。
  * 聚合用 **max** 而不是 sum：否则长段（说了很多但都是废话）会霸榜。
  */
@@ -183,8 +229,11 @@ function pickSegments(
   for (const item of ranked) {
     const ref = sentences[item.index];
     if (!ref) continue;
+    // 修正乘在**句子**这一层（而不是段），这样「一段里又有串场又有干货」
+    // 时，干货那一句的分数不会被串场那句拖下去。
+    const score = item.score * sentenceWeight(ref.text);
     const previous = segScores.get(ref.segIndex) ?? 0;
-    if (item.score > previous) segScores.set(ref.segIndex, item.score);
+    if (score > previous) segScores.set(ref.segIndex, score);
   }
 
   const candidates = segments

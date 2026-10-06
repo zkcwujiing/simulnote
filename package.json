@@ -12,6 +12,7 @@
     "preview": "vite preview",
     "typecheck": "tsc -b --force",
     "test": "node --import ./scripts/test-register.mjs --test tests/unit/",
+    "bench:summary": "node --import ./scripts/test-register.mjs scripts/summary-bench.mjs",
     "lint:cost": "node scripts/check-zero-cost.mjs",
     "lint:size": "node scripts/check-upload-size.mjs",
     "verify": "pnpm build && pnpm test && pnpm lint:cost && node scripts/check-upload-size.mjs --warn-only"

@@ -54,7 +54,7 @@ V1–V8 八个体检项的**实测报告**。它们是整个项目的地基：M0
 | `V3.md` | Chrome 内置 Translator API | 桌面 Chrome 138+ |
 | `V4.md` | opus-mt / bergamot 的 WASM 质量与速度 | 桌面 + 手机 |
 | `V5.md` | WebLLM 跑 Qwen2.5-1.5B 做摘要 | 桌面（可选） |
-| `V6.md` | 纯 JS TextRank 抽取式摘要的兜底质量 | 任意设备（秒出） |
+| `V6.md` | 纯 JS TextRank 抽取式摘要的兜底质量（**已由 `pnpm bench:summary` 自动化，不能手改**） | 任意设备（秒出） |
 | `V7.md` | Silero VAD 的 CPU 占用 | 桌面 + 手机 |
 | `V8.md` | **移动端真实能力边界（内存 / 配额 / OOM 阈值）** | **每台目标手机都要单独跑** |
 
