@@ -14,7 +14,7 @@ import {
   formatNumber,
   isNumberWord,
   numberFromWords,
-  scaleZh,
+  scaledZh,
 } from '@/lib/numberZh';
 
 const MONTHS: Record<string, string> = {
@@ -74,26 +74,25 @@ function extractFromSentence(sentence: string, segIndex: number, context: string
   // "12%" 已被上面覆盖；"a third of" 这类分数不强求
 
   // ---- 金额 ----
-  const symbolMoney = /([$€£¥])\s*(\d[\d,]*(?:\.\d+)?)\s*(million|billion|thousand|m|bn|k)?/gi;
+  const symbolMoney = /([$€£¥])\s*(\d[\d,]*(?:\.\d+)?)\s*(million|billion|thousand|trillion|m|mn|bn|k)?/gi;
   for (const m of sentence.matchAll(symbolMoney)) {
     const value = Number(m[2].replace(/,/g, ''));
-    const scale = m[3] ? scaleZh(normalizeScale(m[3])) : null;
     const cur = currencyZh(m[1]) ?? '';
-    const text = scale ? `${formatNumber(value)}${scale}${cur}` : `${formatNumber(value)}${cur}`;
+    // ⚠️ 必须「先乘倍率、再按中文进位渲染」：4.8 million 是 480万，不是 4.8万。
+    const text = scaledZh(value, m[3]) + cur;
     found.push({ raw: m[0].trim(), zh: text, index: m.index ?? 0, kind: 'money' });
   }
 
   const wordMoney =
-    /(\d[\d,]*(?:\.\d+)?)\s*(million|billion|thousand)?\s*(dollars?|euros?|pounds?|yuan|rmb|yen|usd|eur|gbp)/gi;
+    /(\d[\d,]*(?:\.\d+)?)\s*(million|billion|thousand|trillion|m|mn|bn|k)?\s*(dollars?|euros?|pounds?|yuan|rmb|yen|usd|eur|gbp)/gi;
   for (const m of sentence.matchAll(wordMoney)) {
     const raw = m[0].trim();
     if (found.some((f) => f.raw.includes(raw))) continue;
     const value = Number(m[1].replace(/,/g, ''));
-    const scale = m[2] ? scaleZh(normalizeScale(m[2])) : null;
     const cur = currencyZh(m[3]) ?? '';
     found.push({
       raw,
-      zh: scale ? `${formatNumber(value)}${scale}${cur}` : `${formatNumber(value)}${cur}`,
+      zh: scaledZh(value, m[2]) + cur,
       index: m.index ?? 0,
       kind: 'money',
     });
@@ -101,7 +100,7 @@ function extractFromSentence(sentence: string, segIndex: number, context: string
 
   // ---- 工期 / 时长 ----
   const durationRe =
-    /(\d[\d,]*(?:\.\d+)?|(?:[a-z]+(?:[-\s]+[a-z]+){0,2}))\s*(seconds?|minutes?|hours?|days?|weeks?|months?|quarters?|years?)\b/gi;
+    /(\d[\d,]*(?:\.\d+)?|(?:[a-z]+(?:[-\s]+[a-z]+){0,2}))\s*(milliseconds?|seconds?|minutes?|hours?|days?|weeks?|months?|quarters?|years?|ms|secs?|mins?|hrs?|wks?|yrs?)\b/gi;
   for (const m of sentence.matchAll(durationRe)) {
     // 跳过 "3 years old" 这种；以及 "two days ago" 其实也是时长，保留
     const value = parseNumericPhrase(m[1]);
@@ -122,31 +121,57 @@ function extractFromSentence(sentence: string, segIndex: number, context: string
     const raw = m[0].trim();
     if (found.some((f) => f.raw.includes(raw))) continue;
     const value = Number(m[1].replace(/,/g, ''));
-    const scale = scaleZh(m[2]);
-    if (!scale) continue;
-    found.push({ raw, zh: `${formatNumber(value)}${scale}`, index: m.index ?? 0, kind: 'quantity' });
+    found.push({ raw, zh: scaledZh(value, m[2]), index: m.index ?? 0, kind: 'quantity' });
   }
 
-  const compactScale = /\b(\d+(?:\.\d+)?)\s*(k|m|bn)\b/g;
+  const compactScale = /\b(\d+(?:\.\d+)?)\s*(k|m|mn|bn|tn)\b/g;
   for (const m of sentence.matchAll(compactScale)) {
     const raw = m[0].trim();
     if (found.some((f) => f.raw.includes(raw))) continue;
-    const map: Record<string, string> = { k: '千', m: '万', bn: '亿' };
     found.push({
       raw,
-      zh: `${formatNumber(Number(m[1]))}${map[m[2].toLowerCase()]}`,
+      zh: scaledZh(Number(m[1]), m[2]),
       index: m.index ?? 0,
       kind: 'quantity',
     });
   }
 
   // ---- 日期与时间点 ----
-  const monthRe = new RegExp(String.raw`\b(${Object.keys(MONTHS).join('|')})\.?\s+(\d{1,2})\b`, 'gi');
+  // "March 15, 2026" 整体成一条（英文里年份跟在逗号后面，前面没有介词，
+  // 所以下面的 yearRe 抓不到它 —— 结果就是「月日有了、年份丢了」）。
+  // 先跑这条长的，并记下它占用的区间，免得短的那条再把 "March 15" 抓一遍。
+  const monthDayYearRe = new RegExp(
+    String.raw`\b(${Object.keys(MONTHS).join('|')})\.?\s+(\d{1,2})(?:st|nd|rd|th)?\s*,?\s+((?:19|20)\d{2})\b`,
+    'gi',
+  );
+  const consumed: Array<[number, number]> = [];
+  for (const m of sentence.matchAll(monthDayYearRe)) {
+    const month = MONTHS[m[1].toLowerCase()];
+    if (!month) continue;
+    const start = m.index ?? 0;
+    consumed.push([start, start + m[0].length]);
+    found.push({
+      raw: m[0].trim(),
+      zh: `${m[3]}年${month}${Number(m[2])}日`,
+      index: start,
+      kind: 'date',
+    });
+  }
+  const overlapsConsumed = (index: number) => consumed.some(([a, b]) => index >= a && index < b);
+
+  const monthRe = new RegExp(
+    String.raw`\b(${Object.keys(MONTHS).join('|')})\.?\s+(\d{1,2})(?:st|nd|rd|th)?\b`,
+    'gi',
+  );
   for (const m of sentence.matchAll(monthRe)) {
+    if (overlapsConsumed(m.index ?? 0)) continue;
     const month = MONTHS[m[1].toLowerCase()];
     if (!month) continue;
     found.push({ raw: m[0].trim(), zh: `${month}${Number(m[2])}日`, index: m.index ?? 0, kind: 'date' });
   }
+
+  // 注：故意**不做**「光秃秃的月份名」（"in February"）—— `may` / `march` 同时也是
+  // 情态动词和普通动词，句首大写的 "May" 更是无法与月份区分，误报率远高于收益。
 
   const weekdayRe = new RegExp(String.raw`\b(${Object.keys(WEEKDAYS).join('|')})\b`, 'gi');
   for (const m of sentence.matchAll(weekdayRe)) {
@@ -213,39 +238,88 @@ function extractFromSentence(sentence: string, segIndex: number, context: string
   }));
 }
 
-function normalizeScale(word: string): string {
-  const w = word.toLowerCase();
-  if (w === 'm' || w === 'mm') return 'million';
-  if (w === 'bn' || w === 'b') return 'billion';
-  if (w === 'k') return 'thousand';
-  return w;
+/** 句首出现时不可信的普通词（避免把 "The team" 当成专名）。 */
+const SENTENCE_STARTERS = new Set([
+  'the', 'we', 'this', 'that', 'there', 'they', 'it', 'and', 'i', 'you',
+  'he', 'she', 'a', 'an', 'but', 'so', 'now', 'then', 'if', 'our', 'my',
+]);
+
+/** 句中也可能大写、但不是专名的词。 */
+const COMMON_CAPITALIZED = new Set([
+  'i', "i'm", "i've", "i'll", "i'd", 'ok', 'okay', 'god', 'yeah', 'well',
+  'today', 'tomorrow', 'yesterday', 'next', 'first', 'second', 'third',
+]);
+
+export interface ProperHit {
+  name: string;
+  /** 这个专名第一次出现时所在的句子（英文），用作「出处」 */
+  context: string;
+  segIndex: number;
 }
 
 /**
- * 抽取专有名词：连续 2 个以上的首字母大写词，且不是句首的普通词。
- * 用于把 "Project Atlas"、"Google Cloud" 这类实体捞出来放进关键词/事实里。
+ * 抽取专有名词。
+ *
+ * 两条路一起走：
+ *  1. **连续 2 个以上首字母大写词** —— "Google Cloud"、"Project Atlas" 这类；
+ *  2. **单个大写单词** —— "PostgreSQL"、"Kubernetes"、"Kafka"。
+ *     单个词要能信，必须满足「不在句首」或「带内部大写」（`/[a-z][A-Z]/`，
+ *     如 PostgreSQL、YouTube）。句首那个大写词永远只是句子的开头，
+ *     拿它当专名会把 "Revenue"、"Growth" 这类普通词全捞进来。
+ *
+ * 为什么必须把单个词也捞上：R4 的对策是「英文里的数字/日期/**专有名词**
+ * 单独抽出，作为不受翻译影响的独立字段」。而技术会议里最需要保真的恰恰是
+ * PostgreSQL / Kubernetes / Kafka 这种单词专名 —— 译文里它们经常被直译成
+ * 「邮局」「库伯内蒂斯」之类。只认连续大写词等于把这一类整个漏掉。
  */
-function extractProperNouns(sentences: string[]): string[] {
-  const counts = new Map<string, number>();
-  for (const sentence of sentences) {
-    const matches = sentence.match(/\b[A-Z][a-zA-Z0-9.'-]*(?:\s+[A-Z][a-zA-Z0-9.'-]*){1,3}\b/g);
-    if (!matches) continue;
-    for (const match of matches) {
-      const cleaned = match.trim();
-      const words = cleaned.split(/\s+/);
-      // 去掉句首的普通大写词（The, We, This...）
-      const first = words[0].toLowerCase();
-      if (words.length === 2 && ['the', 'we', 'this', 'that', 'there', 'they', 'it', 'and'].includes(first)) {
-        continue;
+function extractProperNouns(texts: string[]): ProperHit[] {
+  const count = new Map<string, number>();
+  const firstSeen = new Map<string, ProperHit>();
+
+  const add = (name: string, sentence: string, segIndex: number) => {
+    const cleaned = name.trim().replace(/[.,;:]+$/, '').replace(/['’]s$/, '');
+    if (cleaned.length < 3) return;
+    const key = cleaned.toLowerCase();
+    count.set(key, (count.get(key) ?? 0) + 1);
+    if (!firstSeen.has(key)) firstSeen.set(key, { name: cleaned, context: sentence.trim(), segIndex });
+  };
+
+  texts.forEach((text, segIndex) => {
+    for (const sentence of text.split(/(?<=[.!?。！？])\s+/)) {
+      if (!sentence.trim()) continue;
+
+      // 已经在多词专名里用掉的位置，不再被单词那一路重复认领
+      const consumed: Array<[number, number]> = [];
+
+      const multi = sentence.match(/\b[A-Z][a-zA-Z0-9.'-]*(?:\s+[A-Z][a-zA-Z0-9.'-]*){1,3}\b/g) ?? [];
+      for (const raw of multi) {
+        const start = sentence.indexOf(raw);
+        if (start < 0) continue;
+        const words = raw.trim().split(/\s+/);
+        if (words.length === 2 && SENTENCE_STARTERS.has(words[0].toLowerCase())) continue;
+        consumed.push([start, start + raw.length]);
+        add(raw, sentence, segIndex);
       }
-      if (cleaned.length < 4) continue;
-      counts.set(cleaned, (counts.get(cleaned) ?? 0) + 1);
+
+      const tokens = [...sentence.matchAll(/\b[A-Z][a-zA-Z0-9.'-]*\b/g)];
+      for (let i = 0; i < tokens.length; i++) {
+        const token = tokens[i][0];
+        const at = tokens[i].index ?? 0;
+        if (consumed.some(([from, to]) => at >= from && at < to)) continue;
+        const innerCapital = /[a-z][A-Z]/.test(token);
+        if (i === 0 && !innerCapital) continue; // 句首大写词不可信
+        const lower = token.toLowerCase();
+        if (COMMON_CAPITALIZED.has(lower)) continue;
+        if (/^[A-Z]{1,3}\d+$/.test(token)) continue; // Q3 之类交给日期抽取
+        add(token, sentence, segIndex);
+      }
     }
-  }
-  return [...counts.entries()]
-    .sort((a, b) => b[1] - a[1])
+  });
+
+  return [...firstSeen.entries()]
+    .sort((a, b) => (count.get(b[0]) ?? 0) - (count.get(a[0]) ?? 0))
     .slice(0, 24)
-    .map(([name]) => name);
+    .map(([, hit]) => hit);
 }
 
 export interface ExtractFactsOptions {
@@ -279,14 +353,14 @@ export function extractFacts(texts: string[], options: ExtractFactsOptions = {})
 
   // 专有名词单独补一轮，标为 proper
   const proper = extractProperNouns(texts);
-  for (const name of proper) {
+  for (const hit of proper) {
     if (all.length >= totalLimit + 30) break;
-    if (all.some((f) => f.raw.toLowerCase() === name.toLowerCase())) continue;
+    if (all.some((f) => f.raw.toLowerCase() === hit.name.toLowerCase())) continue;
     all.push({
-      raw: name,
-      zh: name,
-      context: '',
-      segIndex: -1,
+      raw: hit.name,
+      zh: hit.name,
+      context: hit.context,
+      segIndex: hit.segIndex,
       kind: 'proper',
     });
   }

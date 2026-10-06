@@ -72,6 +72,12 @@ export interface SummaryResult {
   mode: 'extractive' | 'generative';
   /** 覆盖了多少段、多少字，便于用户判断纪要是否可信 */
   coverage: { segments: number; chars: number };
+  /**
+   * 数字回填的现场记录（R4）。
+   * 每一条都是「我改动了什么、或者哪里没对上」，供 UI 摊开给用户看 ——
+   * 自动改写译文却不吭声，比不改更糟。
+   */
+  numberFixes?: string[];
 }
 
 export interface SessionStats {

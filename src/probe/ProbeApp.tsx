@@ -238,6 +238,12 @@ export default function ProbeApp() {
 
       const need = 700; // 手机档「ASR + MT」两个 q8 模型的粗估常驻需求
       const bothLoaded = res !== null && res.asrError === null && res.mtError === null;
+      // 到探针自己的上限就停 = 只量到一个**下界**，真实余量更大。
+      // 上一份报告把下界当成精确值写了（「还剩 2048 MB」），那是读数的人为天花板。
+      const headroomAtLeast = res?.headroomStoppedEarly ?? false;
+      const ceilingAtLeast = r.ceiling.failedAtMb === null;
+      const headroomText =
+        headroom === null ? '没跑成' : `${headroomAtLeast ? '≥ ' : ''}${headroom} MB`;
       const state: ProbeState =
         bothLoaded && headroom !== null
           ? headroom >= 256
@@ -251,23 +257,28 @@ export default function ProbeApp() {
 
       const verdict = bothLoaded && headroom !== null
         ? headroom >= 256
-          ? `两个模型同时驻留后还剩 ${headroom} MB ——「边听边译」有余量。`
+          ? `两个模型同时驻留后还剩 ${headroomText}${headroomAtLeast ? '（只量到下界，真实余量更大）' : ''} ——「边听边译」有余量。`
           : headroom >= 128
-            ? `两个模型同时驻留后只剩 ${headroom} MB —— 能跑，但**不该再加任何常驻模型**（本地 LLM、第二语言、长会话都要省着用）。`
-            : `两个模型同时驻留后只剩 ${headroom} MB —— 余量太薄，「ASR + MT」同时跑有被系统杀标签页的风险。`
+            ? `两个模型同时驻留后只剩 ${headroomText} —— 能跑，但**不该再加任何常驻模型**（本地 LLM、第二语言、长会话都要省着用）。`
+            : `两个模型同时驻留后只剩 ${headroomText} —— 余量太薄，「ASR + MT」同时跑有被系统杀标签页的风险。`
         : ceilingMb >= need
           ? `空设备能拿 ${ceilingMb} MB，但第二段没能跑起来（${res?.asrError ?? res?.mtError ?? r.residentError ?? '原因不明'}），「两个模型同时驻留」还没有凭据。`
           : `空设备只拿到 ${ceilingMb} MB，低于 ${need} MB 的安全线 —— 这台设备必须走「零下载 / 服务器识别」档。`;
 
       const pct = (v: number | null | undefined) => (v === null || v === undefined ? '—' : `${v} ms`);
       const details: Record<string, string> = {
-        '第一段 · 空设备上限': `${ceilingMb} MB（步长 ${r.ceiling.stepMb} MB；首次失败 ${
-          r.ceiling.failedAtMb === null ? '未失败' : `${r.ceiling.failedAtMb} MB`
+        '第一段 · 空设备上限': `${ceilingMb} MB（步长 ${r.ceiling.stepMb} MB；${
+          ceilingAtLeast
+            ? '到探针上限就停，**真实上限更高**，这只是下界'
+            : `在 ${r.ceiling.failedAtMb} MB 处真的写不进去了`
         }）`,
         '第一段 · 耗时（秒）': (r.ceiling.durationMs / 1000).toFixed(1),
         '第二段 · ASR 驻留': res?.asrError ? `失败：${res.asrError}` : pct(res?.asrMs),
         '第二段 · MT 驻留': res?.mtError ? `失败：${res.mtError}` : pct(res?.mtMs),
-        '第二段 · 两个模型都驻留后的余量': headroom === null ? '没跑成' : `${headroom} MB`,
+        '第二段 · 两个模型都驻留后的余量':
+          headroom === null
+            ? '没跑成'
+            : `${headroomText}${headroomAtLeast ? `（到 ${res?.headroomCapMb} MB 上限主动停，真实余量比这个数大）` : ''}`,
         '第二段 · 是否到顶就停': res
           ? res.headroomStoppedEarly
             ? `是（到 ${res.headroomCapMb} MB 上限主动停，没往死里推）`
@@ -275,7 +286,9 @@ export default function ProbeApp() {
           : '—',
         '堆占用（加载前 → 模型就绪）':
           res && res.heapUsedBeforeMb !== null
-            ? `${res.heapUsedBeforeMb} → ${res.heapUsedLoadedMb} MB（内核上限 ${res.heapLimitMb} MB）`
+            ? res.heapReadingSane
+              ? `${res.heapUsedBeforeMb} → ${res.heapUsedLoadedMb} MB（内核上限 ${res.heapLimitMb} MB）`
+              : `${res.heapUsedBeforeMb} → ${res.heapUsedLoadedMb} MB（内核上限 ${res.heapLimitMb} MB）—— **读数不可信**：模型权重与探针的 Float32Array 都是堆外后备存储，不计入 JS 堆，所以 used 会超过 limit 且几乎不变。这个数字对「边听边译」没有参考价值。`
             : '这个内核不暴露 performance.memory（iOS Safari 就是这样）',
         'ASR 模型': whisperModel,
         'MT 模型': mtModel,

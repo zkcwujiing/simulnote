@@ -52,6 +52,9 @@ export function SummaryView() {
 
   const [toast, setToast] = useState('');
 
+  // 数字回填的现场记录（R4）。空数组时整块不渲染。
+  const numberFixes = summary?.numberFixes ?? [];
+
   const exportInput = useMemo<ExportInput>(
     () => ({
       title: summary?.title || '同传纪要',
@@ -127,7 +130,8 @@ export function SummaryView() {
                 <tr className="text-left text-xs text-slate-500">
                   <th className="border-b border-ink-700 pb-2 pr-3 font-normal">英文原文</th>
                   <th className="border-b border-ink-700 pb-2 pr-3 font-normal">中文</th>
-                  <th className="border-b border-ink-700 pb-2 font-normal">类型</th>
+                  <th className="border-b border-ink-700 pb-2 pr-3 font-normal">类型</th>
+                  <th className="border-b border-ink-700 pb-2 font-normal">出处</th>
                 </tr>
               </thead>
               <tbody>
@@ -137,14 +141,32 @@ export function SummaryView() {
                       {fact.raw}
                     </td>
                     <td className="border-b border-ink-800 py-2 pr-3 text-slate-100">{fact.zh}</td>
-                    <td className="border-b border-ink-800 py-2 text-xs text-slate-500">
+                    <td className="border-b border-ink-800 py-2 pr-3 text-xs text-slate-500">
                       {KIND_ZH[fact.kind] ?? fact.kind}
+                    </td>
+                    <td className="border-b border-ink-800 py-2 text-xs text-slate-500">
+                      {fact.segIndex >= 0 ? `第 ${fact.segIndex + 1} 段` : '—'}
                     </td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
+
+          {numberFixes.length > 0 && (
+            <div className="mt-3 rounded-md border border-ink-700 bg-ink-900/60 p-3">
+              <p className="text-xs text-slate-400">
+                译文里的数字已按上面的原文核对，改动了 {numberFixes.length} 处：
+              </p>
+              <ul className="mt-2 grid gap-1">
+                {numberFixes.map((item, i) => (
+                  <li key={i} className="text-xs leading-5 text-slate-300">
+                    · {item}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </Section>
       )}
 

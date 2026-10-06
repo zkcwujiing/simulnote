@@ -18,6 +18,7 @@ import type { FinalSegment, Keyword, SummaryResult } from '@/types';
 import type { SumEngine, SummarizeInput } from '../types';
 import { DECISION_CUES, ACTION_CUES, GLOSSARY, STOPWORDS } from '@/lib/glossary';
 import { extractFacts } from './facts';
+import { backfillNumbers, type BackfillEdit } from './backfill';
 import { hierarchicalTextRank, mmrSelect, textRank, tokenize } from './textRank';
 
 interface SentenceRef {
@@ -73,16 +74,30 @@ export class ExtractiveSumEngine implements SumEngine {
     onChunk?.('正在挑选要点…');
     const pickedSegments = pickSegments(sentences, segments, maxKeyPoints);
 
+    // 「数字回填」的现场记录：填回了什么、哪里还没对上。
+    // 这些是**要摊给用户看**的 —— 自动改写译文却不吭声，比不改更糟。
+    const fixes: string[] = [];
+    const dropped: string[] = [];
+    const applyBackfill = (english: string, chinese: string): string => {
+      const fixed = backfillNumbers(english, chinese);
+      for (const edit of fixed.edits) fixes.push(describeEdit(edit));
+      for (const fact of fixed.missing) dropped.push(`原文里的「${fact.zh}」在译文里找不到`);
+      return fixed.text;
+    };
+
     const keyPoints = pickedSegments.map((index) => {
       const zh = translations[index];
-      if (zh && zh.trim()) return zh.trim();
+      if (zh && zh.trim()) return applyBackfill(segments[index].text, zh.trim());
       // 没有译文时诚实标注，不假装是中文
       return `〔原文〕${segments[index].text.trim()}`;
     });
 
     onChunk?.('正在扫描结论与待办…');
-    const decisions = collectByCues(segments, translations, DECISION_CUES, 5);
-    const actions = collectByCues(segments, translations, ACTION_CUES, 6);
+    const collectFix = (edits: BackfillEdit[]) => {
+      for (const edit of edits) fixes.push(describeEdit(edit));
+    };
+    const decisions = collectByCues(segments, translations, DECISION_CUES, 5, collectFix);
+    const actions = collectByCues(segments, translations, ACTION_CUES, 6, collectFix);
 
     onChunk?.('正在统计关键词…');
     const keywords = collectKeywords(englishTexts, maxKeywords);
@@ -109,6 +124,7 @@ export class ExtractiveSumEngine implements SumEngine {
       generatedAt: Date.now(),
       mode: 'extractive',
       coverage: { segments: segments.length, chars },
+      numberFixes: [...fixes, ...dropped],
     };
   }
 }
@@ -193,6 +209,7 @@ function collectByCues(
   translations: (string | undefined)[],
   cues: readonly string[],
   limit: number,
+  onBackfill?: (edits: BackfillEdit[]) => void,
 ): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
@@ -203,7 +220,12 @@ function collectByCues(
     if (!hit) continue;
 
     const zh = translations[i]?.trim();
-    const line = zh && zh.length > 0 ? zh : `〔原文〕${segments[i].text.trim()}`;
+    let line = zh && zh.length > 0 ? zh : `〔原文〕${segments[i].text.trim()}`;
+    if (zh && zh.length > 0) {
+      const fixed = backfillNumbers(segments[i].text, zh);
+      line = fixed.text;
+      if (fixed.edits.length > 0) onBackfill?.(fixed.edits);
+    }
     const fingerprint = line.slice(0, 40).toLowerCase();
     if (seen.has(fingerprint)) continue;
     seen.add(fingerprint);
@@ -212,6 +234,14 @@ function collectByCues(
   }
 
   return out;
+}
+
+/** 把一次回填写成一句能直接给用户看的话。 */
+function describeEdit(edit: BackfillEdit): string {
+  if (edit.reason === 'placeholder') {
+    return `补回「${edit.to}」（原文 ${edit.raw}）`;
+  }
+  return `折叠重复日期：${edit.from} → ${edit.to}`;
 }
 
 /** TF 排序取关键词，并用内置词表补中文。 */

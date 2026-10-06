@@ -454,7 +454,7 @@ export interface MemoryStressResult {
  *    这是**故意**的：我们要的就是那个阈值。
  */
 export async function stressMemory(
-  maxMb = 3072,
+  maxMb = MEMORY_CEILING_MB,
   stepMb = 64,
   onStep?: (achievedMb: number) => void,
 ): Promise<MemoryStressResult> {
@@ -532,6 +532,13 @@ export interface MemoryResidentResult {
   heapLimitMb: number | null;
   heapUsedBeforeMb: number | null;
   heapUsedLoadedMb: number | null;
+  /**
+   * `performance.memory` 的读数是否可信。
+   * 不可信的典型形态是 used > limit —— 模型权重与探针自己分配的 Float32Array
+   * 都是**堆外**后备存储，不计入 V8 的 JS 堆，所以这个数字既不会涨也不会跌，
+   * 上一份真机报告里就出现了 `3185.27 → 3185.27 MB（内核上限 1077.65 MB）`。
+   */
+  heapReadingSane: boolean;
   /** 两个模型都驻留后，还能真正写入的 MB */
   headroomMb: number;
   /** 这次分配的上限（第一段上限的 95%，并封顶 2048 MB） */
@@ -610,14 +617,14 @@ export async function benchMemoryBudget(opts: {
     note(`堆占用：加载前 ${before} MB → 两个模型就绪 ${loaded} MB`);
   }
 
-  const cap = Math.min(
-    2048,
-    opts.ceilingMb === null ? 1024 : Math.max(256, Math.floor(opts.ceilingMb * 0.95)),
-  );
+  // 上限取「第一段已经证明这台设备拿得到」的量，不再乘 0.95：
+  // 乘 0.95 会让余量又变成一个「到上限就停」的假数字（上一份报告里
+  // 两段都是撞上限停的，等于什么都没量到）。这里绝不超出第一段已证实的量。
+  const cap = opts.ceilingMb === null ? 1024 : Math.max(256, Math.round(opts.ceilingMb));
   notes.push(
     opts.ceilingMb === null
       ? `没跑第一段，本次分配上限按默认 ${cap} MB 封顶。`
-      : `分配上限取第一段 ${opts.ceilingMb} MB 的 95%，即 ${cap} MB —— 到点就停，不再往死里推。`,
+      : `分配上限取第一段已证实的 ${cap} MB —— 要是又在这里停住，说明真实余量比这个数更大，报告里会写成「≥」。`,
   );
   note(`开始分配（上限 ${cap} MB）…`);
 
@@ -637,6 +644,10 @@ export async function benchMemoryBudget(opts: {
   }
   await new Promise((res) => setTimeout(res, 300));
 
+  const limit = heapLimit();
+  const heapReadingSane =
+    limit !== null && before !== null && loaded !== null && before <= limit && loaded <= limit;
+
   return {
     asrModelId: opts.asrModelId,
     mtModelId: opts.mtModelId,
@@ -644,9 +655,10 @@ export async function benchMemoryBudget(opts: {
     mtMs,
     asrError,
     mtError,
-    heapLimitMb: heapLimit(),
+    heapLimitMb: limit,
     heapUsedBeforeMb: before,
     heapUsedLoadedMb: loaded,
+    heapReadingSane,
     headroomMb: alloc.achievedMb,
     headroomCapMb: cap,
     headroomStoppedEarly: alloc.failedAtMb === null,
@@ -666,6 +678,15 @@ export async function benchMemoryBudget(opts: {
 // ─────────────────────────────────────────────────────────────
 
 const MEMORY_PARTIAL_KEY = 'simulnote.v8.partial';
+
+/**
+ * V8 第一段的分配上限。
+ *
+ * 原来是 3072，结果在 16 GB 的桌面上**两段都撞上限停住**，报告里写出来的
+ * 「空设备 3072 MB / 余量 2048 MB」全是读数的人为天花板，不是设备的真实边界 ——
+ * 等于白跑一趟。抬到 5120 让桌面能真的撞到墙；真撞到墙的设备也不会到这一步。
+ */
+const MEMORY_CEILING_MB = 5120;
 
 export interface MemoryPartial {
   stage: 'ceiling' | 'ceiling-done' | 'headroom' | 'done';
@@ -720,7 +741,7 @@ export async function benchMemoryFull(opts: {
   clearMemoryPartial();
 
   note('第一段：从 64 MB 起逐块写入，直到写不进去为止…');
-  const ceiling = await stressMemory(3072, 64, (mb) => {
+  const ceiling = await stressMemory(MEMORY_CEILING_MB, 64, (mb) => {
     if (mb % 512 === 0) note(`已占用 ${mb} MB…`);
     saveMemoryPartial({ stage: 'ceiling', ceilingMb: mb, headroomMb: null, at: Date.now() });
   });

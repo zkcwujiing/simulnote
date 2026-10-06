@@ -135,24 +135,79 @@ const CURRENCY_ZH: Record<string, string> = {
   yen: '日元',
 };
 
-const SCALE_ZH: Record<string, string> = {
-  hundred: '百',
-  thousand: '千',
-  million: '万',
-  billion: '亿',
-  trillion: '万亿',
+/**
+ * 英文进位词的**倍率**。
+ *
+ * ⚠️ 曾经这里是一张 `million → '万'` 的字符串表，那是错的：
+ * `4.8 million` 是 480 万，不是 4.8 万（差 100 倍）；`4.8 billion` 是 48 亿，
+ * 不是 4.8 亿（差 10 倍）。英中的进位是错位的，**必须先乘倍率、再按中文进位渲染**，
+ * 不能把单位直接贴上去。这张表改成倍率之后，`toZhNumber()` 负责进位。
+ */
+const SCALE_VALUE: Record<string, number> = {
+  hundred: 100,
+  thousand: 1_000,
+  million: 1_000_000,
+  billion: 1_000_000_000,
+  trillion: 1_000_000_000_000,
+};
+
+/** 缩写倍率：3k / 4.8M / 2bn。 */
+const COMPACT_VALUE: Record<string, number> = {
+  k: 1_000,
+  m: 1_000_000,
+  mn: 1_000_000,
+  bn: 1_000_000_000,
+  b: 1_000_000_000,
+  tn: 1_000_000_000_000,
 };
 
 const DURATION_ZH: Record<string, string> = {
-  second: '秒', seconds: '秒',
-  minute: '分钟', minutes: '分钟',
-  hour: '小时', hours: '小时',
+  second: '秒', seconds: '秒', sec: '秒', secs: '秒',
+  millisecond: '毫秒', milliseconds: '毫秒', ms: '毫秒',
+  minute: '分钟', minutes: '分钟', min: '分钟', mins: '分钟',
+  hour: '小时', hours: '小时', hr: '小时', hrs: '小时',
   day: '天', days: '天',
-  week: '周', weeks: '周',
-  month: '个月', months: '个月',
+  week: '周', weeks: '周', wk: '周', wks: '周',
+  month: '个月', months: '个月', mo: '个月',
   quarter: '个季度', quarters: '个季度',
-  year: '年', years: '年',
+  year: '年', years: '年', yr: '年', yrs: '年',
 };
+
+/** 英语进位词（million / billion…）的倍率；不是进位词返回 null。 */
+export function scaleValue(raw: string): number | null {
+  return SCALE_VALUE[raw.toLowerCase()] ?? null;
+}
+
+/** 缩写进位（k / M / bn）的倍率。 */
+export function compactValue(raw: string): number | null {
+  return COMPACT_VALUE[raw.toLowerCase()] ?? null;
+}
+
+/**
+ * 把一个数值按**中文进位**渲染：万 / 亿 / 万亿。
+ *
+ * 4_800_000 → "480万"；480_000_000 → "4.8亿"；820 → "820"。
+ * 一万以下不加单位（"1234" 比 "0.1234万" 好读）。
+ */
+export function toZhNumber(value: number): string {
+  if (!Number.isFinite(value)) return String(value);
+  const abs = Math.abs(value);
+  const sign = value < 0 ? '-' : '';
+  if (abs >= 1e12) return `${sign}${formatNumber(abs / 1e12)}万亿`;
+  if (abs >= 1e8) return `${sign}${formatNumber(abs / 1e8)}亿`;
+  if (abs >= 1e4) return `${sign}${formatNumber(abs / 1e4)}万`;
+  return `${sign}${formatNumber(abs)}`;
+}
+
+/** 把「数值 + 英文进位词」渲染成中文写法；没有进位词时按普通数值渲染。 */
+export function scaledZh(value: number, scaleWord?: string | null): string {
+  if (!scaleWord) return toZhNumber(value);
+  const compact = compactValue(scaleWord);
+  if (compact) return toZhNumber(value * compact);
+  const scale = scaleValue(scaleWord);
+  if (scale) return toZhNumber(value * scale);
+  return toZhNumber(value);
+}
 
 export function currencyZh(raw: string): string | null {
   const key = raw.toLowerCase().replace(/[^a-z$€£¥]/g, '');
@@ -161,10 +216,6 @@ export function currencyZh(raw: string): string | null {
   // "US dollars" / "Australian dollars"
   const last = key.split(/\s+/).pop() ?? key;
   return CURRENCY_ZH[last] ?? null;
-}
-
-export function scaleZh(raw: string): string | null {
-  return SCALE_ZH[raw.toLowerCase()] ?? null;
 }
 
 export function durationZh(raw: string): string | null {

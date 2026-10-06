@@ -11,9 +11,10 @@
     "build": "node scripts/fetch-models.mjs --check && tsc -b && vite build",
     "preview": "vite preview",
     "typecheck": "tsc -b --force",
+    "test": "node --import ./scripts/test-register.mjs --test tests/unit/",
     "lint:cost": "node scripts/check-zero-cost.mjs",
     "lint:size": "node scripts/check-upload-size.mjs",
-    "verify": "pnpm build && pnpm lint:cost && node scripts/check-upload-size.mjs --warn-only"
+    "verify": "pnpm build && pnpm test && pnpm lint:cost && node scripts/check-upload-size.mjs --warn-only"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.3.0",
