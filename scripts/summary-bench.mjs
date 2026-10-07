@@ -9,29 +9,29 @@
  * 语料和一个会做算术的脚本 —— 否则「我觉得摘要还行」不是验收，是感觉。
  *
  * 语料格式见 `docs/results/corpus/meeting-en.txt`：
- *   `@ ` 开头 = 人工判定的要点（ground truth）
+ *   `@ ` 开头 = 这句话是**要点**（ground truth，也是一句真实讲过的話）
+ *   `- ` 开头 = 铺垫 / 过程 / 闲聊（同样会喂给引擎，只是不该进要点列表）
  *   `#`  开头 = 注释
- *   其它非空行 = 真实讲话内容（铺垫、过程、闲聊）
  *
  * 两种喂法（**都要看，因为它们回答的是不同的问题**）
  * --------------------------------------------------
- *   full   把 `@ ` 去掉后**连同**原文一起喂给引擎。回答「引擎能不能把已经写在
- *          纸上的要点挑出来」—— 上限高，但会高估。
- *   speech **只喂原文**，标注完全不进引擎。回答「一句话都没标过的时候，引擎能
- *          不能自己找到该进纪要的那几句」—— 这才是真实场景。
+ *   speech 把 `@` 与 `-` 两类行**都**喂给引擎，引擎不知道哪句是哪句。回答「一句话
+ *          都没标过的时候，引擎能不能自己找到该进纪要的那几句」—— 这才是真实场景。
+ *   full   **只喂 `@` 行**。要点的字面已经全在输入里，回答「匹配算法坏没坏」。
  *   `speech` 是更诚实的那个数字，因此报告里把它排在前面。
  *
  * ⚠️ 诚实声明
  * ----------
- * 1. 标注是**改写**而非原文摘录（`@ Revenue reached 4.8 million dollars…`
- *    对应的原句是 `revenue came in at 4.8 million dollars…`），所以命中判定
- *    只能按内容词重合度来算，不能按字符串相等。脚本用 Jaccard ≥ 0.5。
- * 2. 标注集是一份**理想纪要**，信息量比逐字转写大（例：`@ The board rejected
- *    the Northwind acquisition…` 在原句里只体现为「62 要 95，董事会觉得站不住」）。
- *    所以 `speech` 模式下的「要点 recall」天然偏低，这不是引擎的错。
- * 3. 要点条数 K 由 `defaultKeyPointCount()` 决定（本语料 54 段 → K = 6），
- *    而标注有 19 条 —— **recall@K 在数学上就上不了 70%**。真正该盯的是
- *    precision@K 与「决策/待办有没有漏掉」。见报告里的说明。
+ * 1. 语料在 2026/10/7 重做过一次：旧版把「标注」与「讲话」分成两类行，而标注是
+ *    **改写**（`@ The board rejected the Northwind acquisition…` 对应的原句只说
+ *    「62 要 95，董事会觉得站不住」），有些标注甚至含原文根本没有的数字
+ *    （churn `2.1 → 3.4`）。后果是 recall 天然偏低，而且没人分得清哪部分是引擎的错。
+ *    新版改成一句话一行、逐句标「是不是要点」，并把原先只存在于标注里的那几条
+ *    事实**补回原文**。现在 ground truth 是逐字句子，命中判定仍然按内容词重合度算
+ *    （`MATCH_THRESHOLD`），不按字符串相等。
+ * 2. 要点条数 K 由 `defaultKeyPointCount()` 决定（40 句 → K = 5），而要点有 23 条 ——
+ *    **recall@K 在数学上就上不了 70%**。真正该盯的是 precision@K 与「决策/待办有没有
+ *    漏掉」。见报告里的说明。
  *
  * 用法
  * ----
@@ -62,9 +62,13 @@ function parseCorpus(raw) {
     if (t.startsWith('#')) {
       lines.push({ kind: 'comment', text: t });
     } else if (t.startsWith('@')) {
-      lines.push({ kind: 'annotation', text: t.replace(/^@\s*/, '').trim() });
+      // 要点行：既是 ground truth，也是一句真实讲过的話
+      lines.push({ kind: 'key', text: t.replace(/^@\s*/, '').trim() });
+    } else if (t.startsWith('-')) {
+      lines.push({ kind: 'filler', text: t.replace(/^-\s*/, '').trim() });
     } else {
-      lines.push({ kind: 'speech', text: t });
+      // 没前缀的裸行：按「不是要点」处理，兼容旧语料
+      lines.push({ kind: 'filler', text: t });
     }
   }
   return lines;
@@ -145,15 +149,16 @@ function stripOriginalPrefix(s) {
 // ---------------------------------------------------------------------------
 
 async function runMode(mode, lines) {
-  const annotations = lines.filter((l) => l.kind === 'annotation').map((l) => l.text);
+  const annotations = lines.filter((l) => l.kind === 'key').map((l) => l.text);
   const annotationWords = annotations.map(contentWords);
 
   let fed;
   if (mode === 'full') {
-    // `@ ` 去掉之后连标注一起喂
-    fed = lines.filter((l) => l.kind !== 'comment').map((l) => l.text);
+    // 只喂要点行：字面已经在输入里，只看匹配算法坏没坏
+    fed = annotations;
   } else {
-    fed = lines.filter((l) => l.kind === 'speech').map((l) => l.text);
+    // 诚实档：要点行与铺垫行一起喂，引擎不知道哪句是哪句
+    fed = lines.filter((l) => l.kind !== 'comment').map((l) => l.text);
   }
 
   const segments = fed.map((text, i) => ({
@@ -280,18 +285,18 @@ function buildReport(corpusRaw, full, speech) {
   L.push('');
   L.push(`- 语料：\`docs/results/corpus/meeting-en.txt\`（sha256 前 12 位 \`${sha}\`）`);
   L.push(`- 引擎：\`${new ExtractiveSumEngine().id}\``);
-  L.push(`- 标注要点数：**${speech.annotationCount}** 条；原文句数：**${speech.segmentCount}**`);
+  L.push(`- 要点句数（ground truth）：**${speech.annotationCount}** 条；喂进引擎的句数：**${speech.segmentCount}**`);
   L.push(`- 要点条数 K = **${speech.k}**（由 \`defaultKeyPointCount(${speech.segmentCount})\` 决定）`);
   L.push('');
   L.push('## 两种喂法');
   L.push('');
-  L.push('| 指标 | `speech`（只喂原文，诚实档） | `full`（连标注一起喂） | 验收线 |');
+  L.push('| 指标 | `speech`（要点句与铺垫句一起喂，诚实档） | `full`（只喂要点句，对照组） | 验收线 |');
   L.push('| --- | --- | --- | --- |');
   L.push(`| 要点条数 K | ${speech.k} | ${full.k} | — |`);
   L.push(`| 命中要点数 | ${speech.hits} | ${full.hits} | — |`);
   L.push(`| **precision@K** | **${pct(speech.precision)}** | ${pct(full.precision)} | ≥ 70% |`);
   L.push(`| recall@K（受 K 限制） | ${pct(speech.recall)} | ${pct(full.recall)} | 见下说明 |`);
-  L.push(`| 数字保留率（分母 = 标注∩原文） | ${pct(speech.digitCoverage)}（${speech.digitTotal} 个） | ${pct(full.digitCoverage)}（${full.digitTotal} 个） | ≥ 95% |`);
+  L.push(`| 数字保留率（分母 = 要点∩原文） | ${pct(speech.digitCoverage)}（${speech.digitTotal} 个） | ${pct(full.digitCoverage)}（${full.digitTotal} 个） | ≥ 95% |`);
   L.push(`| 数字表条数 / 原文数字种类 | ${speech.factCount} / ${speech.sourceDigitCount} | ${full.factCount} / ${full.sourceDigitCount} | — |`);
   L.push(`| 幻觉条数 | ${speech.hallucinated.length} | ${full.hallucinated.length} | = 0 |`);
   L.push(`| 决策/待办命中 | ${speech.cueHits}/${speech.cueTargetCount} | ${full.cueHits}/${full.cueTargetCount} | ≥ 70% |`);
@@ -363,27 +368,27 @@ function buildReport(corpusRaw, full, speech) {
       '应改写成「precision@K ≥ 70% 且决策/待办命中 ≥ 70%」——' +
       '一份一页纸的纪要本来就不该复述整场会议，而**漏掉决策**才是真事故。',
   );
-  L.push('2. **`full` 档数字好看但没有意义**，因为标注本身就是高质量要点，等于把答案');
-  L.push('   抄在了试卷上。它以对照组的身份留着，用来验证「命中判定」这套匹配算法本身没坏。');
-  L.push('3. **标注是改写，不是摘录。** 命中用重合系数 `|A∩B| / min(|A|,|B|) ≥ 0.5`');
-  L.push('   （不是 Jaccard —— 改写句长度常差一倍，Jaccard 会把挑对的判成错的，脚本注释里有实例）。');
-  L.push('   即便如此，0.5~0.7 的命中仍是这个弱标准的固有噪声，不要拿小数点后一位当趋势。');
-  L.push('4. **标注集比逐字转写「更聪明」**（例：`@ The board rejected the Northwind');
-  L.push('   acquisition…` 对应原句只是「62 要 95，董事会觉得站不住」）。所以 `speech` 档的');
-  L.push('   决策/待办命中偏低里，有一部分是标注写了原文没说透的东西，不能全记在引擎头上。');
-  L.push('   同理，数字保留率的分母是「标注 ∩ 原文」—— 只拿引擎真有机会看到的数字算账。');
-  L.push('5. **precision@K 会低估引擎，而且低估得刚好是本次修掉的那类错误。**');
-  L.push('   修复前 `speech` 档的头名是 `Let me walk through where we are on the quarter…`、');
-  L.push('   第 5 名是 `Also please read the incident review before the meeting…` —— ');
-  L.push('   两句都是主持人串场/客套，一个字都不该进纪要。');
-  L.push('   `sentenceWeight()`（`src/engines/sum/extractiveSum.ts`）按「中心度 ≠ 信息量」');
-  L.push('   给这类句子降权后，它们都被挤了出去，换上来的两句是');
-  L.push('   `Support ticket volume is down about 18 percent since that change.` 与');
-  L.push('   `Their contract has a price review clause and we should get ahead of it.`。');
-  L.push('   但 precision 一动不动：语料里**根本没有**给 ticket volume 那条写标注，');
-  L.push('   而 vendor 那条的标注只与原文共享 `price` 一个词（重合系数 0.167）。');
-  L.push('   指标看不见的改善，仍然是改善 —— 判据是「挑出来的是不是要点」，不是分数。');
-  L.push('6. **幻觉 = 0 是硬不变量**，也是唯一进了 `--check` 的门。数字表里的每条事实都必须');
+  L.push('2. **`full` 档数字好看但没有意义**：它只拿到要点句，等于把答案抄在了试卷上。');
+  L.push('   它以对照组的身份留着，用来验证「命中判定」这套匹配算法本身没坏 ——');
+  L.push('   如果 `full` 档都到不了 100%，那是脚本坏了，不是引擎坏了。');
+  L.push('3. **语料在 2026/10/7 重做过**（见 `docs/07` R4 与语料头部注释）。旧版把「人工');
+  L.push('   标注」与「讲话原文」分成两类行，而标注是**改写**，有些标注甚至比原文更聪明：');
+  L.push('   `@ The board rejected the Northwind acquisition…` 对应的原句只说了「62 要 95，');
+  L.push('   董事会觉得站不住」；churn `2.1 → 3.4` 这个数字**原文里根本没有**。那会让 recall');
+  L.push('   天然偏低，而且没人分得清哪部分是引擎的错。新版改成**一句话一行、逐句标');
+  L.push('   「是不是要点」**，并把原先只存在于标注里的那几条事实补回原文。');
+  L.push('4. **新旧两版的数字不能直接比。** 旧版 `speech` 档 precision@K 是 60.0%、决策/待办是');
+  L.push('   1/5，而且头名是 `Let me walk through where we are on the quarter…` 这种主持人串场句；');
+  L.push('   新版是 100.0%、4/4。这个变化里既有 `sentenceWeight()`（`src/engines/sum/extractiveSum.ts`，');
+  L.push('   按「中心度 ≠ 信息量」给串场/客套降权）的功劳，也有语料重做的功劳 ——');
+  L.push('   **这份报告无法把两者分开**，不要把它读成「算法涨了 40 个点」。');
+  L.push('5. **命中判定用重合系数 `|A∩B| / min(|A|,|B|) ≥ 0.5`**，不是 Jaccard：改写句长度常差');
+  L.push('   一倍，Jaccard 会把挑对的判成错的（脚本注释里有实例）。现在 ground truth 是逐字句子，');
+  L.push('   命中相似度基本是 1.00，这条噪声已经很弱 —— 但语料仍只有一份 5 KB 的合成会议，');
+  L.push('   够回答「引擎有没有在乱挑」，不够证明「摘要好」，也远少于 `docs/06` 要的「3 段真实英文演讲」。');
+  L.push('6. **数字保留率的分母是「要点 ∩ 原文」** —— 只拿引擎真有机会看到的数字算账；');
+  L.push('   要点里有、原文里没有的数字会单独列出来当资料，不进分母。');
+  L.push('7. **幻觉 = 0 是硬不变量**，也是唯一进了 `--check` 的门。数字表里的每条事实都必须');
   L.push('   能在英文原文里逐字找到 —— 摘要是抽取式的，出现一条原文没有的数字就是 bug。');
   L.push('');
   return L.join('\n');
@@ -403,7 +408,7 @@ writeFileSync(REPORT_URL, `${report}\n`, 'utf8');
 
 const rel = (u) => fileURLToPath(u).replace(`${process.cwd()}\\`, '').replace(`${process.cwd()}/`, '');
 
-console.log(`语料 ${lines.filter((l) => l.kind !== 'comment').length} 行（标注 ${speech.annotationCount} 条）`);
+console.log(`语料 ${lines.filter((l) => l.kind !== 'comment').length} 行（其中要点 ${speech.annotationCount} 条）`);
 console.log('');
 console.log('  档位      K  命中  precision  recall   数字保留  幻觉  决策/待办');
 for (const r of [speech, full]) {

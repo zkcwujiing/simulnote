@@ -1,80 +1,70 @@
 # V6 评测语料 · 一次典型的英文业务例会（约 10 分钟口播量）
 #
 # 为什么要有这个文件：docs/06 §6.2 说 V6 要判断「TextRank 能不能挑出真正重要的句子」。
-# 光看输出靠人感觉，结论就没法比对、也没法回归。所以这里把语料**先标好**：
+# 光看输出靠人感觉，结论就没法比对、也没法回归。所以这里把语料**先标好**。
 #
-#   以 "@ " 开头的行 = 人工判定为「这段讲话里真正的要点」
-#   其它非空行        = 铺垫、过程描述、闲聊（不该进要点列表）
-#   "#" 开头          = 注释，不参与计算
+# 格式（2026/10/7 重做过一次，原因见下）：
+#
+#   "@ " 开头的行 = 这句话是**要点**（既是 ground truth，也是要喂给引擎的讲话）
+#   "- " 开头的行 = 这句话是铺垫 / 过程 / 闲聊，不该进要点列表（同样要喂给引擎）
+#   "#" 开头的行  = 注释，不参与计算
 #
 # 评测脚本 scripts/summary-bench.mjs 会跑两种喂法：
-#   full   —— 去掉 "@ " 前缀后**连标注一起**喂给引擎（对照组，等于答在试卷上，只看匹配算法有没有坏）
-#   speech —— **只喂原文行**（诚实档，报告里排前面）
-# 然后用「引擎挑出的前 K 句」与人工标注求 precision / recall。
+#   speech —— 把 @ 与 - 两类行**都**喂给引擎（诚实档：真实场景就是这样，没人提前标好）
+#   full   —— **只喂 @ 行**（对照组：要点的字面已经在输入里，只看匹配算法坏没坏）
+# speech 是更诚实的那个数字，报告里排在前面。
 #
-# ⚠️ 已知缺陷（2026/10/6，见 docs/results/V6.md 与 docs/07 R4）：
-#    这里的标注是**改写**而不是逐字摘录，有些标注甚至比原文更「聪明」
-#    （例：@ The board rejected the Northwind acquisition… 对应的原句只是
-#     「62 要 95，董事会觉得站不住」，根本没提「董事会否决」）。
-#    因此 speech 档的决策/待办命中率偏低里，有一部分是语料构造造成的，
-#    不能全记在引擎头上。真要验收「决策抽取」，语料得重做成
-#    「先有逐字转写、再从中摘决策」的样子。
+# ⚠️ 为什么在 2026/10/7 重做
+#    旧版把「人工标注」与「讲话原文」分成两类行，而标注是**改写**而不是逐字摘录，
+#    有些标注甚至比原文更聪明 —— 标注写 `@ The board rejected the Northwind
+#    acquisition…`，对应的原句只说了「62 要 95，董事会觉得站不住」；`churn 2.1→3.4`
+#    这个数字**原文里根本没有**。后果：speech 档的 recall 天然偏低，而且没人分得清
+#    哪部分是引擎的错。新版改成**一句话一行、逐句标「是不是要点」**，并把原先只
+#    存在于标注里的那几条事实**补回讲话原文**（churn 数字、推迟欧洲发布、Sarah 的
+#    交付日期）—— 不然引擎永远没机会挑到它们，那不是评测，是陷阱。
 #
-# ⚠️ 诚实声明：标注只有我一个人做的，是个**弱标准**。它不能证明「摘要好」，
-#    但足以回答「TextRank 是不是在乱挑」以及「改动之后有没有变差」。
+# ⚠️ 诚实声明：标注是一个人做的，是个**弱标准**。它不能证明「摘要好」，
+#    但足以回答「引擎是不是在乱挑」以及「改动之后有没有变差」。
 #    真正上线前仍然要让真人读一遍输出（探针页的 V6 那一节就是干这个的）。
 
-Good morning everyone, thanks for joining on short notice.
-Let me walk through where we are on the quarter and then we have three decisions to make.
-First, the top line: revenue came in at 4.8 million dollars, which is up 23 percent from last quarter.
-@ Revenue reached 4.8 million dollars, up 23 percent quarter over quarter, and that is well above plan.
-Gross margin held steady at 61 percent even though infrastructure cost went up.
-@ Gross margin held at 61 percent despite higher infrastructure cost.
-The reason we did not lose margin is that we renegotiated the cloud contract in February.
-Enterprise renewals carried the quarter, especially in the manufacturing segment.
-@ Enterprise renewals, particularly manufacturing, were the main driver of the quarter.
-We lost two logos in retail, and honestly both of them were price decisions rather than product problems.
-On the product side, the new billing pipeline finally shipped.
-It shipped three weeks late, and I want to be direct about why.
-The migration to PostgreSQL took longer than estimated because we discovered data quality problems halfway through.
-@ The billing pipeline shipped three weeks late because the PostgreSQL migration took longer than estimated.
-The good news is that latency dropped from 820 milliseconds to 140 milliseconds after the rewrite.
-@ Latency improved from 820 milliseconds to 140 milliseconds, and users did notice.
-Support ticket volume is down about 18 percent since that change.
-Now the harder part, which is the incident we had on the ninth.
-@ On the ninth we had a 41 minute outage caused by a bad configuration push.
-It was 41 minutes of degraded service, and about a third of our customers saw errors.
-The root cause was that we pushed a configuration change without a staged rollout.
-Nobody was paged for eleven minutes because the alert threshold was set for the old traffic pattern.
-@ The outage lasted 41 minutes and nobody was paged for 11 minutes because the alert threshold was stale.
-I am not going to blame anyone individually, but we do need to change the process.
+- Good morning everyone, thanks for joining on short notice.
+- Let me walk through where we are on the quarter and then we have three decisions to make.
+@ First, the top line: revenue came in at 4.8 million dollars, which is up 23 percent from last quarter.
+@ Gross margin held steady at 61 percent even though infrastructure cost went up.
+- The reason we did not lose margin is that we renegotiated the cloud contract in February.
+@ Enterprise renewals carried the quarter, especially in the manufacturing segment.
+@ We lost two logos in retail, and honestly both of them were price decisions rather than product problems.
+- On the product side, the new billing pipeline finally shipped.
+@ It shipped three weeks late, and I want to be direct about why.
+@ The migration to PostgreSQL took longer than estimated because we discovered data quality problems halfway through.
+@ The good news is that latency dropped from 820 milliseconds to 140 milliseconds after the rewrite.
+@ Support ticket volume is down about 18 percent since that change.
+- Now the harder part, which is the incident we had on the ninth.
+@ It was 41 minutes of degraded service, and about a third of our customers saw errors.
+@ The root cause was that we pushed a configuration change without a staged rollout.
+@ Nobody was paged for eleven minutes because the alert threshold was set for the old traffic pattern.
+- I am not going to blame anyone individually, but we do need to change the process.
 @ We decided that no configuration change may go out without a staged rollout to ten percent of traffic first.
-We also decided to move the alert threshold review into the weekly operations meeting.
-@ Alert thresholds will now be reviewed every week in the operations meeting.
-Let me move to the plan for next quarter.
-The headline is that we want to double the size of the data team.
-@ For next quarter the plan is to double the data team, from four to eight people.
-That means four hires, and realistically two of them will take a quarter to become productive.
-Hiring is the bottleneck, not budget.
-@ Hiring, not budget, is the bottleneck for the next quarter.
-On the European launch, I know this has been on the roadmap for a while.
-@ We decided to postpone the European launch to the second half of the year.
-The reason is that the localization work is bigger than we scoped, and we do not want to launch half ready.
-Sarah put together a revised estimate and it came out at roughly eleven weeks of engineering.
-@ The revised localization estimate is about eleven weeks of engineering work.
-There was also the acquisition question, and I should report what happened.
+@ We also decided to move the alert threshold review into the weekly operations meeting.
+- Let me move to the plan for next quarter.
+@ The headline is that we want to double the size of the data team.
+- That means four hires, and realistically two of them will take a quarter to become productive.
+@ Hiring is the bottleneck, not budget.
+@ On the European launch, we are going to postpone it to the second half of the year.
+- I know that launch has been on the roadmap for a while.
+- The reason is that the localization work is bigger than we scoped, and we do not want to launch half ready.
+@ Sarah put together a revised estimate and it came out at roughly eleven weeks of engineering.
+- There was also the acquisition question, and I should report what happened.
 @ The board rejected the Northwind acquisition because the valuation was too high.
-We offered 62 million and they wanted 95 million, and the board felt that was not defensible.
-@ Our offer was 62 million dollars and the asking price was 95 million dollars.
-I personally think walking away was the right call, but reasonable people disagree.
-Two more things before we close.
-@ Watch the churn rate, which moved from 2.1 percent to 3.4 percent this quarter.
-We do not fully understand that movement yet and I do not want to guess in this meeting.
+@ We offered 62 million dollars and they wanted 95 million dollars.
+- I personally think walking away was the right call, but reasonable people disagree.
+- Two more things before we close.
+@ Churn moved from 2.1 percent to 3.4 percent this quarter and we do not fully understand that movement yet.
+- I do not want to guess about it in this meeting.
 @ Sarah will send the revised forecast by Friday the fifteenth of March.
-Platform team will publish a written incident review before the next meeting.
-@ The platform team must publish a written incident review before the next review meeting.
-Also please read the incident review before the meeting, not during it.
-There is one more risk worth naming out loud.
+@ The platform team will publish a written incident review before the next meeting.
+- Also please read the incident review before the meeting, not during it.
+- There is one more risk worth naming out loud.
 @ There is a real risk that our main vendor will raise prices again next year.
-Their contract has a price review clause and we should get ahead of it.
-Okay, that is everything I had. Thanks again, and let us keep this to forty five minutes next time.
+- Their contract has a price review clause and we should get ahead of it.
+- Okay, that is everything I had. Thanks again, and let us keep this to forty five minutes next time.
