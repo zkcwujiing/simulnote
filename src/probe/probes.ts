@@ -15,6 +15,7 @@
 
 import { configureModelSource, fetchLogText, forgetSource, localModelPath, resetFetchLog } from '@/lib/modelSource';
 import { activeOrtRuntime, configureOrtWasm } from '@/lib/ortEnv';
+import { deviceMemoryGb, mobileEvidence } from '@/lib/device';
 
 /**
  * 裸取一个文件，**绕开 transformers.js 和 ORT**，只走浏览器原生 `fetch`。
@@ -1318,6 +1319,32 @@ export async function probeMicCapability(): Promise<MicCapability> {
 // 报告生成：把结果变成一段能直接粘回来的 Markdown
 // ─────────────────────────────────────────────────────────────
 
+/**
+ * 每一份报告都自带设备指纹。
+ *
+ * 为什么要有这个：2026/10/6~10/7 连收三份「只有 V8 段、没有 P0 段」的报告，三份都写
+ * `是否移动端: false`，而用户坚持是在手机上跑的 —— 没有 UA，整件事成了悬案。
+ * 根因是每个 section 上都有自己的「复制」按钮，用户只复制了跑过的那一段。
+ * 与其反复要求「记得把运行环境也复制上」，不如让**每一段**自己带上指纹。
+ */
+function deviceFingerprintLines(): string[] {
+  if (typeof navigator === 'undefined') return [];
+  const evidence = mobileEvidence();
+  const touch = typeof navigator.maxTouchPoints === 'number' ? navigator.maxTouchPoints : 0;
+  const screenText =
+    typeof screen === 'undefined' ? '未暴露' : `${screen.width}×${screen.height} @${window.devicePixelRatio}`;
+  const memory = deviceMemoryGb();
+  return [
+    '## 设备指纹（每份报告都自带，不用另找）',
+    '',
+    `- 判定：${evidence.verdict ? '手机 / 平板' : '桌面（或者是伪装成桌面的手机）'}`,
+    `- 依据：${evidence.signals.join('；')}`,
+    `- User-Agent：${navigator.userAgent}`,
+    `- 触点数 ${touch} · 屏幕 ${screenText} · 逻辑核心 ${navigator.hardwareConcurrency ?? '未知'} · deviceMemory ${memory ?? '未暴露'} GB`,
+    '',
+  ];
+}
+
 export function toMarkdownReport(results: ProbeResult[]): string {
   const lines: string[] = [];
   lines.push('# SimulNote M0 探针报告');
@@ -1325,6 +1352,7 @@ export function toMarkdownReport(results: ProbeResult[]): string {
   lines.push(`- 采集时间：${new Date().toLocaleString('zh-CN')}`);
   lines.push(`- 页面地址：${location.href}`);
   lines.push('');
+  lines.push(...deviceFingerprintLines());
   for (const r of results) {
     if (r.state === 'idle') continue;
     lines.push(`## ${r.id} · ${r.title}`);

@@ -23,6 +23,7 @@ import {
   type ProbeState,
 } from './probes';
 import { activeSource, clearModelCache, encoderRelFor, forgetSource, sourceUrlsForTest } from '@/lib/modelSource';
+import { deviceMemoryGb, mobileEvidence } from '@/lib/device';
 
 const CARD = 'rounded-2xl border border-slate-700/70 bg-slate-900/70 p-4';
 const BTN =
@@ -171,8 +172,10 @@ export default function ProbeApp() {
       if (!device.wasmThreads) notes.push('没有多线程 WASM（缺 COOP/COEP，速度约为一半）');
       if (gpu.available) notes.push('有 WebGPU');
       if (!mic.audioWorklet && !mic.scriptProcessor) notes.push('既没有 AudioWorklet 也没有 ScriptProcessor');
-      if (!device.uaDataMobile && /Android|iPhone|iPad|iPod/i.test(device.userAgent))
-        notes.push('看起来是手机但 userAgentData.mobile 不可用（已用 UA 正则兜住）');
+      if (!device.uaDataMobile) {
+        const ev = mobileEvidence();
+        if (!ev.verdict) notes.push(`判定为「不是手机/平板」（${ev.signals.join('；')}）`);
+      }
 
       return {
         id: 'P0',
@@ -184,6 +187,9 @@ export default function ProbeApp() {
             : `发现 ${notes.length} 个需要注意的点，见下方 notes。`,
         details: {
           运行环境: notes.length ? notes.join('；') : '无异常',
+          '是否移动端（含依据）': mobileEvidence().verdict
+            ? `是 —— ${mobileEvidence().signals.join('；')}`
+            : `否 —— ${mobileEvidence().signals.join('；')}`,
           机型: `${device.platform} · ${device.screen} · DPR ${device.dpr}`,
           逻辑核心数: device.hardwareConcurrency,
           'deviceMemory（GB）': device.deviceMemoryGb ?? '浏览器未暴露',
@@ -266,6 +272,14 @@ export default function ProbeApp() {
           : `空设备只拿到 ${ceilingMb} MB，低于 ${need} MB 的安全线 —— 这台设备必须走「零下载 / 服务器识别」档。`;
 
       const pct = (v: number | null | undefined) => (v === null || v === undefined ? '—' : `${v} ms`);
+      // 设备身份必须自带证据：连收三份写「是否移动端: false」却说是手机的报告，
+      // 而报告里又没有「运行环境」段，谁都说不清跑的是哪台机器。
+      const dev = mobileEvidence();
+      const touchPoints = typeof navigator.maxTouchPoints === 'number' ? navigator.maxTouchPoints : 0;
+      const uaDataMobile = (navigator as Navigator & { userAgentData?: { mobile?: boolean } }).userAgentData?.mobile;
+      const devMemory = deviceMemoryGb();
+      const screenText =
+        typeof screen === 'undefined' ? '—' : `${screen.width}×${screen.height} @${devicePixelRatio}`;
       const details: Record<string, string> = {
         '第一段 · 空设备上限': `${ceilingMb} MB（步长 ${r.ceiling.stepMb} MB；${
           ceilingAtLeast
@@ -293,7 +307,9 @@ export default function ProbeApp() {
         'ASR 模型': whisperModel,
         'MT 模型': mtModel,
         '推理后端 / dtype': `${whisperDevice} / ${dtype}`,
-        是否移动端: String(/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)),
+        是否移动端: `${dev.verdict ? '是' : '否'} —— 依据：${dev.signals.join('；')}`,
+        '设备原始信息（自己核对）': `UA: ${navigator.userAgent}`,
+        '设备原始信息（续）': `触点数 ${touchPoints} · uaData.mobile ${uaDataMobile ?? '不可用'} · 屏幕 ${screenText} · 逻辑核心 ${navigator.hardwareConcurrency ?? '未知'} · deviceMemory ${devMemory ?? '未暴露'} GB`,
         '第一段失败信息': r.ceiling.failureMessage ?? '无',
         备注: [...(res?.notes ?? []), r.residentError ? `第二段异常：${r.residentError}` : '']
           .filter(Boolean)
