@@ -58,14 +58,23 @@ export interface Engine {
 }
 
 export class EngineError extends Error {
-  constructor(
-    message: string,
-    readonly engineId: string,
-    readonly stage: Stage,
-    readonly cause?: unknown,
-  ) {
+  /**
+   * 三个字段写成显式属性 + 构造函数体内赋值，**不是**构造函数参数属性。
+   * 参数属性（`constructor(readonly engineId: string)`）在 Node 的
+   * type-stripping 模式下会抛 `ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX`，
+   * 而单测一旦走到任何 import 到这个模块的路径就会整体失败 ——
+   * 这类错误只在「某个测试恰好引到它」时才出现，排查成本远高于写这两行。
+   */
+  readonly engineId: string;
+  readonly stage: Stage;
+  readonly cause?: unknown;
+
+  constructor(message: string, engineId: string, stage: Stage, cause?: unknown) {
     super(message);
     this.name = 'EngineError';
+    this.engineId = engineId;
+    this.stage = stage;
+    this.cause = cause;
   }
 }
 

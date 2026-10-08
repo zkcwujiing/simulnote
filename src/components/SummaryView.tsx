@@ -4,10 +4,13 @@ import {
   copyText,
   exportMarkdown,
   exportPlainText,
+  exportSrt,
   shareText,
   timecode,
   type ExportInput,
 } from '@/lib/export';
+import { EngineBar } from '@/components/EngineBar';
+import { detectTranscriptLoss } from '@/lib/session/quality';
 import { useSessionStore } from '@/store/sessionStore';
 
 const KIND_ZH: Record<ExtractedFact['kind'], string> = {
@@ -32,6 +35,9 @@ function Section({ title, hint, children }: { title: string; hint?: string; chil
 export function SummaryView() {
   const summary = useSessionStore((s) => s.summary);
   const stats = useSessionStore((s) => s.stats);
+  // 「这一场有没有丢句」要在纪要里留一份，不能只弹一条会消失的提示 ——
+  // 用户往往是在回头看纪要时才发现少了内容。
+  const loss = detectTranscriptLoss(stats);
   const plan = useSessionStore((s) => s.plan);
   const startedAt = useSessionStore((s) => s.startedAt);
   const reset = useSessionStore((s) => s.reset);
@@ -98,11 +104,31 @@ export function SummaryView() {
           </span>
           {stats && (
             <span className="chip border-ink-700 text-slate-400">
-              {stats.finalCount} 句 · {(stats.audioDurationMs / 60000).toFixed(1)} 分钟
+              听到 {(stats.audioDurationMs / 60000).toFixed(1)} 分钟 · 其中说话{' '}
+              {(stats.speechDurationMs / 60000).toFixed(1)} 分钟 · {stats.finalCount} 句
             </span>
           )}
         </div>
       </section>
+
+      {/* 纪要里也要留一份本次的档位：用户往往是回头看纪要时才发现某场效果不对，
+          而那时开始页早就关掉了。 */}
+      <EngineBar />
+
+      {loss && loss.level !== 'ok' && (
+        <section
+          className={`card border ${
+            loss.level === 'lost'
+              ? 'border-danger-600/50 bg-danger-600/5'
+              : 'border-warn-400/40 bg-warn-600/5'
+          }`}
+        >
+          <h2 className={`text-sm font-semibold ${loss.level === 'lost' ? 'text-danger-400' : 'text-warn-400'}`}>
+            {loss.level === 'lost' ? '这一场可能丢了整段内容' : '这一场可能漏了几句话'}
+          </h2>
+          <p className="mt-2 text-xs leading-5 text-slate-300">{loss.message}</p>
+        </section>
+      )}
 
       {summary.keyPoints.length > 0 && (
         <Section title="关键要点" hint="按重要度排序，不是讲话顺序。">
@@ -221,6 +247,9 @@ export function SummaryView() {
           >
             下载纯文本
           </button>
+          <button type="button" className="btn-ghost" onClick={() => exportSrt(exportInput)}>
+            下载 SRT 字幕
+          </button>
           <button
             type="button"
             className="btn-ghost"
@@ -249,6 +278,7 @@ export function SummaryView() {
         {toast && <p className="mt-2 text-xs text-brand-400">{toast}</p>}
         <p className="mt-2 text-xs leading-5 text-slate-500">
           Markdown 文件里带有完整的中英对照转写、时间码和本次使用的引擎说明，不依赖这个网站也能读懂。
+          SRT 是字幕文件，可以直接拖进剪映 / Premiere / VLC —— 正文用中文译文，译不出来的句子退回英文原文。
         </p>
       </section>
 

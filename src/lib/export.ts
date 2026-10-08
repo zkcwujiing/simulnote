@@ -6,6 +6,7 @@
  * 每条要点对应哪一段。所以文件头部有元信息，正文有编号，结尾有引擎披露。
  */
 
+import { detectTranscriptLoss } from '@/lib/session/quality';
 import type { FinalSegment, PipelinePlan, SessionStats, SummaryResult } from '@/types';
 
 export interface ExportInput {
@@ -134,11 +135,19 @@ export function toMarkdown(input: ExportInput): string {
   lines.push(engineDisclosure(plan));
   lines.push('');
   if (stats) {
+    // 「听到多久」和「其中说话多久」是两个不同的量，凑成一个数会让读者
+    // 以为会议真的开了那么久（会议里大部分时间是沉默的）。
+    const minutesOf = (ms: number) => (ms / 60000).toFixed(1);
     lines.push(
-      `- 共 ${stats.finalCount} 句，音频 ${(stats.audioDurationMs / 60000).toFixed(1)} 分钟，平均翻译延迟 ${(
-        stats.meanLatencyMs / 1000
-      ).toFixed(2)} 秒`,
+      `- 收录 ${minutesOf(stats.audioDurationMs)} 分钟，其中识别到说话 ${minutesOf(
+        stats.speechDurationMs,
+      )} 分钟，共 ${stats.finalCount} 句，平均翻译延迟 ${(stats.meanLatencyMs / 1000).toFixed(2)} 秒`,
     );
+    const loss = detectTranscriptLoss(stats);
+    if (loss && loss.level !== 'ok') {
+      lines.push('');
+      lines.push(`> ⚠️ ${loss.message}`);
+    }
   }
   if (summary) {
     lines.push(
@@ -181,6 +190,63 @@ export function toPlainText(input: ExportInput): string {
   return lines.join('\n');
 }
 
+/**
+ * SRT 字幕。
+ *
+ * 三个刻意的决定：
+ *
+ * 1. **正文用中文译文**（同传的产出物就是中文），译不出来时退回英文原文 ——
+ *    宁可给一句英文，也不要给一条空字幕，那会让播放器闪出一段莫名其妙的空白。
+ * 2. **时间轴强制单调不重叠。** 识别给出的 `endMs` 偶尔会越过下一句的 `startMs`，
+ *    而各家播放器对重叠区间的处理不一样（有的丢掉前一条、有的两条叠着显示）。
+ *    这里把出点压到下一句入点前 1 ms。
+ * 3. **文件里除了序号没有任何头。** SRT 规范没有注释语法 —— 加一行说明，
+ *    那行说明就会真的以字幕形式出现在视频里。
+ */
+export function srtTimestamp(ms: number): string {
+  const t = Math.max(0, Math.round(ms));
+  const hours = Math.floor(t / 3_600_000);
+  const minutes = Math.floor((t % 3_600_000) / 60_000);
+  const seconds = Math.floor((t % 60_000) / 1000);
+  return `${pad(hours)}:${pad(minutes)}:${pad(seconds)},${String(t % 1000).padStart(3, '0')}`;
+}
+
+/** 识别没给出终点时的最小时长，避免出现 0 长度的字幕。 */
+const SRT_FALLBACK_CUE_MS = 1200;
+
+export function toSrt(input: ExportInput): string {
+  const { pairs } = input;
+  const cues: { start: number; end: number; text: string }[] = [];
+
+  for (let i = 0; i < pairs.length; i += 1) {
+    const pair = pairs[i];
+    const text = (pair.zh ?? pair.segment.text).replace(/\s*\n\s*/g, ' ').trim();
+    if (!text) continue;
+
+    const start = Math.max(0, pair.segment.startMs);
+    let end = pair.segment.endMs > start ? pair.segment.endMs : start + SRT_FALLBACK_CUE_MS;
+
+    const next = pairs[i + 1];
+    if (next) {
+      const boundary = next.segment.startMs - 1;
+      if (boundary > start) end = Math.min(end, boundary);
+    }
+    // 相邻两句落在同一毫秒时，压完会得到非法区间。宁可重叠 1 ms 也不能写 start == end，
+    // 有些播放器遇到非法区间会直接跳过后面所有字幕。
+    if (end <= start) end = start + 1;
+
+    cues.push({ start, end, text });
+  }
+
+  if (cues.length === 0) return '';
+
+  return (
+    cues
+      .map((cue, i) => `${i + 1}\n${srtTimestamp(cue.start)} --> ${srtTimestamp(cue.end)}\n${cue.text}`)
+      .join('\n\n') + '\n'
+  );
+}
+
 function safeFilename(title: string, ext: string): string {
   const base = title
     .replace(/[\\/:*?"<>|]/g, '')
@@ -210,6 +276,10 @@ export function exportMarkdown(input: ExportInput): void {
 
 export function exportPlainText(input: ExportInput): void {
   downloadText(safeFilename(input.title, 'txt'), toPlainText(input), 'text/plain');
+}
+
+export function exportSrt(input: ExportInput): void {
+  downloadText(safeFilename(input.title, 'srt'), toSrt(input), 'application/x-subrip');
 }
 
 export async function copyText(content: string): Promise<boolean> {

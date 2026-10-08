@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { useRef, type ReactNode } from 'react';
 import type { StagePlan } from '@/types';
 import { PIPELINE_MODES, type PipelineMode } from '@/engines/registry';
 import { DownloadBar } from '@/components/DownloadBar';
@@ -85,6 +85,8 @@ export function PlanPanel({ children }: { children?: ReactNode }) {
   const error = useSessionStore((s) => s.error);
   const download = useSessionStore((s) => s.download);
   const start = useSessionStore((s) => s.start);
+  const transcribeFile = useSessionStore((s) => s.transcribeFile);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const prepare = useSessionStore((s) => s.prepare);
 
   return (
@@ -156,6 +158,35 @@ export function PlanPanel({ children }: { children?: ReactNode }) {
       <p className="text-center text-xs leading-5 text-slate-500">
         点击后会申请麦克风权限{plan && plan.totalBytes > 0 ? '并下载模型' : ''}，浏览器要求这一步必须由你亲自点击。
       </p>
+
+      {/* 上传音频文件：给「已经录好了、想补一份纪要」的场景。
+          它和「开始同传」共用同一条管线与同一份模型，区别只是音频从哪来，
+          所以放在同一层级、同一种视觉重量上，不做成藏在角落的次要入口。 */}
+      <div className="grid gap-2 border-t border-ink-700/70 pt-4">
+        <label className="text-center text-xs leading-5 text-slate-500">
+          已经有一段录音？上传音频文件，同样出字幕、译文和纪要。
+        </label>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="audio/*"
+          className="sr-only"
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            // 清空 value，否则用户选同一个文件第二次不会触发 change。
+            event.target.value = '';
+            if (file) void transcribeFile(file);
+          }}
+        />
+        <button
+          type="button"
+          className="btn-ghost w-full py-2.5"
+          disabled={!plan || status === 'probing' || status === 'running'}
+          onClick={() => fileInputRef.current?.click()}
+        >
+          上传音频文件
+        </button>
+      </div>
 
       {children}
     </div>

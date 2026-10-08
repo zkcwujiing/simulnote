@@ -84,9 +84,15 @@ export interface SessionStats {
   startedAt: number;
   endedAt: number | null;
   finalCount: number;
-  /** 音视频总时长（毫秒） */
+  /**
+   * 采集回调**真正收到**的音频总长（毫秒）。
+   * 注意它不是墙上时钟 —— 麦克风被系统挂起、标签页被冻结时这个数会停止增长，
+   * 而这正是我们要的：它回答的是「应用听见了多久」。
+   */
   audioDurationMs: number;
-  /** 识别出的原文总时长（毫秒），用于丢句检测 */
+  /** VAD 判定「有人在说话」并送进识别的音频总长（毫秒） */
+  speechDurationMs: number;
+  /** 识别交回来的句子时长之和（毫秒），与 `speechDurationMs` 对比用于丢句检测 */
   transcriptDurationMs: number;
   /** 平均「说完 → 出译文」延迟（毫秒） */
   meanLatencyMs: number;

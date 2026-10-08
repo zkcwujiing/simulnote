@@ -3,6 +3,7 @@ import type { CSSProperties } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useSessionStore } from '@/store/sessionStore';
 import { DownloadBar } from '@/components/DownloadBar';
+import { EngineBar } from '@/components/EngineBar';
 import { InterruptionBanner } from '@/components/SessionRecovery';
 import { timecode } from '@/lib/export';
 import type { FinalSegment } from '@/types';
@@ -80,6 +81,8 @@ export function LiveView() {
   const [autoScroll, setAutoScroll] = useState(true);
   const [subScale, setSubScale] = useState(readSubScale);
   const download = useSessionStore((s) => s.download);
+  const fileJob = useSessionStore((s) => s.fileJob);
+  const cancelFile = useSessionStore((s) => s.cancelFile);
 
   const cycleSubScale = useCallback(() => {
     setSubScale((current) => {
@@ -168,6 +171,12 @@ export function LiveView() {
         <InterruptionBanner />
       </div>
 
+      {/* 引擎状态条常驻会话中：开始前那块面板点「开始」就没了，
+          而档位是**每台机器都不一样**的，出问题时用户至少要能复述自己在用哪一档。 */}
+      <div className="px-3 pb-2">
+        <EngineBar />
+      </div>
+
       <div
         ref={parentRef}
         onScroll={onScroll}
@@ -219,9 +228,41 @@ export function LiveView() {
       </div>
 
       <div className="pt-3">
-        <button type="button" className="btn-danger w-full py-3 text-base" onClick={() => void stop()}>
-          结束并生成纪要
-        </button>
+        {fileJob ? (
+          // 文件模式下「结束并生成纪要」是没有意义的 —— 用户要的是把它跑完。
+          // 这里给的是进度与一个真正的中止，而不是一句会被误读成「我已经处理完了」的按钮。
+          <div className="grid gap-2">
+            <div className="flex items-center justify-between text-xs text-slate-400">
+              <span className="min-w-0 truncate">{fileJob.name}</span>
+              <span className="shrink-0">{Math.round(fileJob.ratio * 100)}%</span>
+            </div>
+            <div
+              className="h-1.5 overflow-hidden rounded-full bg-ink-800"
+              role="progressbar"
+              aria-label="音频文件处理进度"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={Math.round(fileJob.ratio * 100)}
+            >
+              <div
+                className="h-full rounded-full bg-brand-500 transition-[width] duration-300"
+                style={{ width: `${Math.max(2, Math.round(fileJob.ratio * 100))}%` }}
+              />
+            </div>
+            <p className="text-xs leading-5 text-slate-500">{fileJob.phase}</p>
+            <button
+              type="button"
+              className="btn-ghost w-full py-2.5"
+              onClick={() => cancelFile()}
+            >
+              停止处理
+            </button>
+          </div>
+        ) : (
+          <button type="button" className="btn-danger w-full py-3 text-base" onClick={() => void stop()}>
+            结束并生成纪要
+          </button>
+        )}
       </div>
     </div>
   );

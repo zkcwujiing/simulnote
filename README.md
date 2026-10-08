@@ -90,7 +90,7 @@ pnpm verify       # 上面三件事一起跑
 
 ## 6. 当前状态
 
-**阶段：M1 最小闭环已跑通、M3 纪要质量已达标 —— 代码可以构建、可以本地运行、模型能从本站加载；M2（手机可用）代码侧已完成并自检通过，等真机验收。**
+**阶段：M1 最小闭环、M3 纪要质量、M4 体验打磨 —— 代码可以构建、可以本地运行、模型能从本站加载；M2（手机可用）与 M4 的代码侧都已完成并自检通过，等真机验收。**
 
 已完成：
 
@@ -103,7 +103,10 @@ pnpm verify       # 上面三件事一起跑
 | 纪要 | `sum-extractive-textrank`：TextRank + MMR 抽取式摘要，外加 `sentenceWeight()` 给串场/客套降权、给含数字与线索词的句子升权；**关键数字由 `sum/facts.ts` 从英文原文按规则抽取**，不经过翻译模型；**质量基准 `pnpm bench:summary` → [`docs/results/V6.md`](docs/results/V6.md)**（数字保留 100%、幻觉 0、precision@5 **100%**、决策/待办 **4/4**） |
 | 决策 | `src/engines/registry.ts`：三档模式（自动 / 完全本地 / 最快启动），探测顺序即优先级，**任何一环都允许降级，绝不白屏** |
 | 模型 | `src/lib/modelSource.ts` 统一配置模型来源（`allowRemoteModels=false` 是护栏）、`scripts/fetch-models.mjs` 负责构建期下载 |
-| 界面 | 环境探测面板、实时双语滚动（虚拟列表）、**字幕字号三档切换并记住**、纪要视图、Markdown/纯文本导出、分享二维码 |
+| 界面 | 环境探测面板、实时双语滚动（虚拟列表）、**字幕字号三档切换并记住**、**引擎状态条**（会话中显示每一环实际用的哪一档，降级时轻提示）、纪要视图、**Markdown / 纯文本 / SRT 字幕三种导出**、分享二维码 |
+| 输入 | 麦克风实时同传，或**上传一段音频文件**（`src/lib/audio/fileSource.ts` + `transcribeFile()`）走同一条管线，出字幕、译文、纪要 |
+| 离线 | **PWA**：`manifest.webmanifest` + `public/sw.js`（模型与 ORT 运行时都已在 Cache Storage 里，断网可继续用） |
+| 会话安全 | **锁屏/切后台中断恢复 + 会话留痕**（`src/lib/session/lifecycle.ts` 订阅 `visibilitychange`/`freeze`/`resume`/`pagehide`/`pageshow`，`draft.ts` 12 小时 TTL / 400 句上限 / 残缺整体作废）、**长会话内存守卫**（`src/lib/session/memory.ts`，只分级与提醒、**刻意不自动降档**）、**下载进度条同时出现在开始页与「准备中」**、**丢句告警**（`src/lib/session/quality.ts`，看的是「识别交回 ÷ 送进识别」而不是「转写 ÷ 音频」）、**错误兜底边界** |
 | 会话安全 | **锁屏/切后台中断恢复 + 会话留痕**（`src/lib/session/lifecycle.ts` 订阅 `visibilitychange`/`freeze`/`resume`/`pagehide`/`pageshow`，`draft.ts` 12 小时 TTL / 400 句上限 / 残缺整体作废）、**长会话内存守卫**（`src/lib/session/memory.ts`，只分级与提醒、**刻意不自动降档**）、**下载进度条同时出现在开始页与「准备中」** |
 | 护栏 | `scripts/check-zero-cost.mjs`（零成本）、`scripts/check-upload-size.mjs`（部署体积） |
 | 验证 | `probe.html` + `src/probe/`：M0 探针页，**已就绪、待真机运行** |
@@ -122,6 +125,9 @@ pnpm verify       # 上面三件事一起跑
    > 因为创建 Pages 站点需要管理员权限，CI 的 `GITHUB_TOKEN` 永远没有（`enablement: true` 也救不了）。详见 [`docs/10-上线清单.md`](docs/10-上线清单.md) 第 3 步。
    > Cloudflare Pages 那份 workflow 仍然保留但改成手动触发，理由见 [`docs/08-零成本方案与分享方式.md`](docs/08-零成本方案与分享方式.md)。
 3. **手机端体验打磨 —— 代码侧已完成，等真机验收** ✅（2026/10/8）：锁屏中断恢复（`lib/session/lifecycle.ts` + `draft.ts`，离开页面先落盘再报状态）、会话留痕（重进页面问「要不要恢复上次没做完的」）、长时间会话的内存守卫、字幕字号三档自适应、下载进度条在「准备中」也不再消失。**M2 的验收条件本身就是「iPhone Safari + Android Chrome 各完成一次完整会话」，这一条只能在真机上做。** 两项**有意没做**：① `sherpa-onnx` 流式 ASR —— V1 从未真机跑过，而现有 whisper 已在真 iPhone 上 RTF 0.25，换它是买更低延迟、不是买可用性；② Playwright 移动端 E2E —— 本仓库没有任何浏览器自动化依赖，而它恰好模拟不出真机的内存压力、锁屏与 Safari 音频中断。理由见 [`docs/06`](docs/06-开发路线图与里程碑.md) §6.4。
+4. **M4 体验打磨 —— 代码侧已完成并自检通过** ✅（2026/10/8）：SRT 字幕导出（正文用中文译文，译不出来时退回英文原文；时间轴强制单调不重叠）、PWA Service Worker（模型与 ORT 运行时都已在 Cache Storage 里，断网可继续用）、会话中的引擎状态条、**上传音频文件**走同一条管线（`lib/audio/fileSource.ts` + `transcribeFile()`）、错误兜底边界。两项需要说明的：① **丢句告警的指标被重新设计** —— 借鉴来的「转写时长 << 音频时长」在旧代码里**永远不会触发**（那字段量的是 VAD 语音时长，比值恒在 1 附近），改成真实音频时长又会每次开会都误报；现在看的是「识别交回 ÷ 送进识别」；② **二次精修有意未做** —— 它要留住音频再解一遍，手机上排不进实时预算，而「高质量配置」在只自托管了一个 ASR 模型的前提下没有对象。两项理由都写在 [`docs/06`](docs/06-开发路线图与里程碑.md) §6.6 与 [`docs/07`](docs/07-风险与对策.md) R24。
+
+**M4 有一处实现细节值得单独记一笔**：上传的音频喂进管线前必须切成 **1600 采样（100 ms）** 的块，不能按秒喂。因为 `lib/audio/vad.ts` 把「帧数」当时间单位（`elapsedMs += frameSize / sampleRate`），喂 1 秒的块会让它把每秒当 100 ms —— 时间戳缩小 10 倍、「连续 3 帧算开口」从 300 ms 变成 3 秒、「静音 700 ms 收尾」变成 7 秒。**不报错，结果全错。**
 
 ### 几个必须知道的事实
 

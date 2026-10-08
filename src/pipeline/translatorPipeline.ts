@@ -43,6 +43,14 @@ import { toChineseError } from '@/lib/errors';
 import { log } from '@/lib/logger';
 import type { InterruptionLevel } from '@/lib/session/lifecycle';
 
+/**
+ * 采集侧统一的采样率。`capture.ts` 的重采样 worklet 会把麦克风音频一律变成
+ * 16 kHz 单声道 f32，所以「这一帧有多长」就是 `frame.length / 16000` 秒。
+ * 这个值在两处 `startCapture(..., { targetRate: 16000 })` 里出现，
+ * 抽成常量是为了让 `onAudioFrame` 里的时长累加不会悄悄跟调用点走散。
+ */
+const CAPTURE_SAMPLE_RATE = 16000;
+
 export type PipelineEvent =
   | { type: 'status'; status: SessionStatus; detail?: string }
   | { type: 'probe'; report: ProbeReport }
@@ -88,7 +96,20 @@ export class TranslatorPipeline {
   private latencySum = 0;
   private latencyCount = 0;
   private degradedCount = 0;
+  /**
+   * `audioDurationMs` 与 `speechDurationMs` 的差别就是「丢句告警」的全部依据，别把两者混起来：
+   *
+   * - `audioDurationMs`：**采集回调真正收到**的音频总长。麦克风被系统挂起、标签页被冻结时，
+   *   墙上的钟照走而回调不再被调用 —— 所以这个数只增不减地反映「应用听见了多少」，
+   *   它是唯一能和「说了多久」对比的量。
+   * - `speechDurationMs`：VAD 判定为「有人在说话」并**送进识别**的音频总长。
+   *   它天然小于 `audioDurationMs`（会议里大量时间是沉默），所以两者之比**不是**告警信号。
+   * - `transcriptDurationMs`（见 `buildStats`）：识别**交回来**的句子时长之和。
+   *   告警看的是它和 `speechDurationMs` 之比 —— 送进去 10 分钟、只回来 3 分钟，
+   *   那才是真的丢句。
+   */
   private audioDurationMs = 0;
+  private speechDurationMs = 0;
   private startedAt = 0;
   private stopped = false;
 
@@ -125,9 +146,16 @@ export class TranslatorPipeline {
   /**
    * 真正开始。**必须由用户手势的调用栈触发** —— 里面会下载模型、
    * 申请麦克风权限。浏览器对这两件事都有手势要求。
+   *
+   * `source: 'file'` 是「上传音频文件」那条路：它同样要用户手势（要下模型），
+   * 但**不申请麦克风**，音频改由 `acceptFileFrame()` 从外面喂进来。
+   * 之所以做成同一个方法的参数、而不是另一个 `startFromFile()`，是因为
+   * 「读模型 / 报状态 / 挂 handler」这三件事两边必须完全一致 ——
+   * 复制一份出来，迟早只有一边被修。
    */
-  async start(): Promise<void> {
+  async start(options: { source?: 'mic' | 'file' } = {}): Promise<void> {
     const resolved = this.ensureResolved();
+    const source = options.source ?? 'mic';
     this.stopped = false;
     this.emit({ type: 'status', status: 'preparing' });
 
@@ -166,9 +194,22 @@ export class TranslatorPipeline {
     };
 
     try {
-      if (resolved.asr.audioSource === 'external') {
+      if (source === 'file') {
+        // 文件模式下管线只当消费者，音频从 acceptFileFrame() 进来。
+        // 前提是 ASR 引擎愿意吃外部音频；自己霸占麦克风的引擎（浏览器原生识别）
+        // 根本没法处理一个文件，这时必须**明确拒绝**而不是假装开始。
+        if (resolved.asr.audioSource !== 'external') {
+          throw new EngineError(
+            '本次选中的识别引擎只能用麦克风实时识别，不能处理上传的音频文件。请在开始页改成其它识别档位再试。',
+            resolved.asr.id,
+            'asr',
+          );
+        }
+        this.emit({ type: 'notice', level: 'info', message: '正在读取音频文件…' });
+        await resolved.asr.start(handlers);
+      } else if (resolved.asr.audioSource === 'external') {
         this.emit({ type: 'notice', level: 'info', message: '正在开启麦克风…' });
-        const capture = await startCapture(this.onAudioFrame, { targetRate: 16000 });
+        const capture = await startCapture(this.onAudioFrame, { targetRate: CAPTURE_SAMPLE_RATE });
         this.capture = capture;
         if (capture.usingFallback) {
           this.emit({
@@ -183,11 +224,27 @@ export class TranslatorPipeline {
         await resolved.asr.start(handlers);
       }
     } catch (error) {
-      const message = toChineseError(error, '无法开始录音');
+      const message = toChineseError(error, source === 'file' ? '无法处理这个音频文件' : '无法开始录音');
       this.emit({ type: 'error', message });
       this.emit({ type: 'status', status: 'error', detail: message });
       await this.cleanupCapture();
     }
+  }
+
+  /**
+   * 文件模式下把一块解码好的音频送进管线。
+   *
+   * 复用 `onAudioFrame` 而不是另开一条路：VAD 切句、时长累加、丢句检测的
+   * 三个计数器全挂在那一个函数里，绕开它就会得到「有字幕但统计全零」这类
+   * 极难发现的不一致。
+   *
+   * 返回 `false` 表示会话已经停了（用户按了停止，或引擎出错），
+   * 调用方应当据此结束喂帧循环。
+   */
+  acceptFileFrame(frame: Float32Array): boolean {
+    if (this.stopped) return false;
+    this.onAudioFrame(frame);
+    return true;
   }
 
   /**
@@ -197,6 +254,8 @@ export class TranslatorPipeline {
    */
   private readonly onAudioFrame = (frame: Float32Array): void => {
     if (this.stopped) return;
+    // 按帧长累加，而不是按墙上时钟 —— 见字段上方的注释。
+    this.audioDurationMs += (frame.length / CAPTURE_SAMPLE_RATE) * 1000;
     const utterance = this.segmenter.push(frame);
     if (utterance) this.feedUtterance(utterance.samples, utterance.startMs, utterance.endMs);
   };
@@ -204,7 +263,7 @@ export class TranslatorPipeline {
   private feedUtterance(samples: Float32Array, startMs: number, endMs: number): void {
     const asr = this.resolved?.asr;
     if (!asr?.feed) return;
-    this.audioDurationMs += Math.max(0, endMs - startMs);
+    this.speechDurationMs += Math.max(0, endMs - startMs);
     try {
       asr.feed({ samples, startMs, endMs });
     } catch (error) {
@@ -268,6 +327,7 @@ export class TranslatorPipeline {
       endedAt: this.stopped ? Date.now() : null,
       finalCount: this.segments.length,
       audioDurationMs: Math.round(this.audioDurationMs),
+      speechDurationMs: Math.round(this.speechDurationMs),
       transcriptDurationMs: Math.round(transcriptDurationMs),
       meanLatencyMs: Math.round(meanLatencyMs),
       degradedCount: this.degradedCount,
@@ -286,10 +346,11 @@ export class TranslatorPipeline {
     const asr = this.resolved?.asr;
 
     // 1) 把分段器里剩下的尾句放出来（很多人会在最后一句说完就点停止）
-    if (this.capture) {
-      const tail = this.segmenter.drain();
-      if (tail) this.feedUtterance(tail.samples, tail.startMs, tail.endMs);
-    }
+    //    这里**不能**用 `if (this.capture)` 做条件：上传文件那条路没有采集句柄，
+    //    而文件末尾几乎总是半句话，卡在这里就等于丢掉最后一个要点。
+    //    `drain()` 在没有累积时返回 null，自己占麦克风的引擎走这条路也不会有副作用。
+    const tail = this.segmenter.drain();
+    if (tail) this.feedUtterance(tail.samples, tail.startMs, tail.endMs);
 
     // 2) 先停采集，再停引擎：顺序反了会让采集继续往已关闭的引擎里灌数据
     await this.cleanupCapture();
@@ -463,7 +524,7 @@ export class TranslatorPipeline {
     }
     await this.cleanupCapture();
     try {
-      this.capture = await startCapture(this.onAudioFrame, { targetRate: 16000 });
+      this.capture = await startCapture(this.onAudioFrame, { targetRate: CAPTURE_SAMPLE_RATE });
       this.emit({
         type: 'notice',
         level: 'warn',
@@ -542,6 +603,10 @@ export class TranslatorPipeline {
     this.segments = [...input.segments];
     this.translations = new Map(Object.entries(input.translations));
     this.audioDurationMs = input.audioDurationMs ?? 0;
+    // 恢复出来的会话**没有**「送进识别多少音频」这个信息 —— 那段音频从来没落过盘。
+    // 于是把分母设成已有的转写时长，让丢句检测得出「没丢」：
+    // 拿一个自己都不知道的分母去报警，只会让用户以为恢复功能本身出了问题。
+    this.speechDurationMs = this.segments.reduce((sum, s) => sum + Math.max(0, s.endMs - s.startMs), 0);
     this.degradedCount = input.degradedCount ?? 0;
     this.startedAt = input.startedAt ?? Date.now();
     this.stopped = true;

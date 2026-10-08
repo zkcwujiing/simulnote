@@ -54,6 +54,8 @@ import {
   readHeap,
   type HeapReading,
 } from '@/lib/session/memory';
+import { describeMicPickup, detectTranscriptLoss } from '@/lib/session/quality';
+import { AudioFileError, FILE_SAMPLE_RATE, readAudioFile } from '@/lib/audio/fileSource';
 
 export interface Notice {
   id: number;
@@ -100,6 +102,30 @@ let heapWarnedAt = 0;
 /** 启动时问用户「要不要恢复」的那份草稿。放在模块变量里，不进 React state。 */
 let pendingDraft: SessionDraft | null = null;
 
+/** 正在进行的「上传音频文件」任务。放在模块变量里，因为它同时是取消句柄。 */
+let fileAbort: AbortController | null = null;
+
+/** 「上传音频文件」任务的进度，用于在界面上替换掉「正在录音」那套提示。 */
+export interface FileJob {
+  name: string;
+  /** 0~1 的读取进度。注意它**只表示读取**，识别进度看 `phase` 的措辞。 */
+  ratio: number;
+  phase: string;
+}
+
+/**
+ * 文件模式允许「已送出」领先「已定稿字幕」多少毫秒。
+ *
+ * 这个数不是随手取的：它要大于**单句最长时长**（`UtteranceSegmenter` 的
+ * `maxSpeechMs = 15000`），否则一句长话还没定稿就被判定成「落后」，
+ * 背压会一直卡在等它。60 秒给了 4 倍余量，同时把待识别队列的上限
+ * 压在「一分钟音频 + 在途那一段」的量级上。
+ */
+const FILE_MAX_LAG_MS = 60_000;
+
+/** 触发背压后多久回头看一眼是否追上。250 ms 是「不烧 CPU」与「不空转太久」的折中。 */
+const FILE_LAG_POLL_MS = 250;
+
 const lifecycle = new LifecycleTracker();
 
 export interface SessionState {
@@ -122,11 +148,17 @@ export interface SessionState {
   interruption: InterruptionNotice | null;
   /** 启动时发现一份没做完的留痕，这里是给用户看的一句话（M2） */
   draftOffer: string | null;
+  /** 正在处理一个上传的音频文件（M4） */
+  fileJob: FileJob | null;
 
   setMode: (mode: 'auto' | 'privacy' | 'speed') => void;
   prepare: () => Promise<void>;
   start: () => Promise<void>;
   stop: () => Promise<void>;
+  /** 上传一个音频文件，跑完整条管线并出纪要（M4） */
+  transcribeFile: (file: File) => Promise<void>;
+  /** 用户在文件处理中途按了停止（M4） */
+  cancelFile: () => void;
   reset: () => void;
   /** 页面离开前台（M2） */
   handleHidden: (snapshot: LifecycleSnapshot) => void;
@@ -158,6 +190,7 @@ const initial = {
   startedAt: null,
   interruption: null,
   draftOffer: null,
+  fileJob: null,
 };
 
 export const useSessionStore = create<SessionState>()((set, get) => {
@@ -260,6 +293,15 @@ export const useSessionStore = create<SessionState>()((set, get) => {
         if (event.status === 'done') {
           // 会话已经结束，留痕没有意义了 —— 留着反而会在下次打开时被当成「未完成的会话」。
           clearDraft();
+          // M4 · 丢句告警。放在这里而不是放在纪要里，是因为它是**关于这次录音**的判断，
+          // 用户此刻还记得自己讲了什么，能立刻判断「是不是真丢了」。
+          const quality = pipeline?.getStats() ?? get().stats;
+          const loss = detectTranscriptLoss(quality);
+          if (loss && loss.level !== 'ok') {
+            pushNotice('warn', loss.message);
+          }
+          const pickup = describeMicPickup(quality);
+          if (pickup) pushNotice('info', pickup);
           // M2 · 长时间会话的内存回收：会话结束后卸掉识别模型。
           // 只卸 ASR（大且不再需要）；再次开始时 init() 会从本地缓存重新加载。
           void pipeline?.releaseAsr().then((released) => {
@@ -381,6 +423,91 @@ export const useSessionStore = create<SessionState>()((set, get) => {
         set({ status: 'error', error: message });
         pushNotice('error', message);
       }
+    },
+
+    /**
+     * 上传一个音频文件，跑完整条管线。
+     *
+     * 与麦克风那条路的关键差别是**它不申请麦克风**，音频由 `acceptFileFrame()`
+     * 从文件里喂进去。除此之外完全复用同一条管线，所以字幕、译文、纪要、
+     * 丢句告警、导出全都一样能用。
+     *
+     * 背压是这个函数里唯一不显然的地方：文本型的识别引擎没有「我还跟得上」的
+     * 回调，所以在手机上把 30 分钟音频一次性灌进去，只会得到一个越来越长的
+     * 待识别队列，最后表现为「进度条走完了但字幕一直不出」。这里的做法是
+     * 拿**已定稿字幕的时长**当消费速度的代理指标，落后超过 `FILE_MAX_LAG_MS`
+     * 就等一下再喂。
+     */
+    async transcribeFile(file: File) {
+      // 重新来一条干净的管线：上一次会话的段落、译文、统计都不该混进来。
+      await teardown();
+      const active = ensurePipeline();
+      const controller = new AbortController();
+      fileAbort = controller;
+
+      const update = (patch: Partial<FileJob>): void => {
+        set((state) => (state.fileJob ? { fileJob: { ...state.fileJob, ...patch } } : {}));
+      };
+
+      set({
+        ...initial,
+        mode: get().mode,
+        fileJob: { name: file.name, ratio: 0, phase: '正在读取音频…' },
+        startedAt: Date.now(),
+      });
+
+      try {
+        await active.prepare();
+        await active.start({ source: 'file' });
+        // `start()` 把错误走事件发出去（不 throw），所以这里要**回读状态**确认
+        // 真的开始了；否则我们会往一条没起来的管线里灌音频。
+        if (get().status === 'error') return;
+
+        let fedFrames = 0;
+        for await (const chunk of readAudioFile(file, {
+          signal: controller.signal,
+          onProgress: (ratio) => update({ ratio, phase: '正在识别…' }),
+        })) {
+          if (controller.signal.aborted) break;
+          if (!active.acceptFileFrame(chunk.samples)) break;
+          fedFrames += chunk.samples.length;
+
+          // 背压：落后太多就先等一等，别把队列堆到手机内存里。
+          const fedMs = (fedFrames / FILE_SAMPLE_RATE) * 1000;
+          while (
+            !controller.signal.aborted &&
+            fedMs - active.getStats().transcriptDurationMs > FILE_MAX_LAG_MS
+          ) {
+            update({ phase: `正在识别…（已送出 ${Math.round(fedMs / 1000)} 秒）` });
+            await new Promise((resolve) => setTimeout(resolve, FILE_LAG_POLL_MS));
+          }
+        }
+
+        update({ phase: '正在收尾、生成纪要…' });
+        await active.stop();
+      } catch (error) {
+        if (error instanceof AudioFileError) {
+          // 解码失败是用户能自己解决的问题（换个格式），给可执行的建议而不是堆栈。
+          pushNotice('error', `${error.message}${error.hint ? `（${error.hint}）` : ''}`);
+          set({ status: 'error', error: error.message });
+        } else {
+          const message = toChineseError(error, '处理音频文件失败');
+          pushNotice('error', message);
+          set({ status: 'error', error: message });
+        }
+      } finally {
+        if (fileAbort === controller) fileAbort = null;
+        set({ fileJob: null });
+      }
+    },
+
+    cancelFile() {
+      fileAbort?.abort();
+      fileAbort = null;
+      // 停止喂帧还不够 —— 管线那边也要收尾，否则它一直停在 running，
+      // 界面会显示成「还在识别」。
+      void pipeline?.stop();
+      set({ fileJob: null });
     },
 
     reset() {
