@@ -1,8 +1,35 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { CSSProperties } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useSessionStore } from '@/store/sessionStore';
+import { DownloadBar } from '@/components/DownloadBar';
+import { InterruptionBanner } from '@/components/SessionRecovery';
 import { timecode } from '@/lib/export';
 import type { FinalSegment } from '@/types';
+
+/*
+ * 字幕字号自适应（M2 第 6 条）。
+ *
+ * 「自适应」在这个项目里不该是靠 media query 猜屏幕 —— 同传的真实场景是
+ * 「手机立在桌上、人离它一两米」，同一个 6 寸屏，站着看和坐下看需要的字号不同。
+ * 所以做成**用户一键切换 + 记住**：三档，默认取中间档，存 localStorage。
+ * 正文用 CSS 变量 `--sub` 下发，中英两行按固定比例跟着缩放，
+ * 避免「中文调大了、英文还很小」这种半截效果。
+ */
+const SUB_SCALE_KEY = 'simulnote.subScale.v1';
+const SUB_SCALES = [15, 18, 22] as const;
+const SUB_SCALE_LABELS = ['小', '中', '大'] as const;
+const SUB_SCALE_DEFAULT = 1;
+
+function readSubScale(): number {
+  try {
+    const n = Number.parseInt(localStorage.getItem(SUB_SCALE_KEY) ?? '', 10);
+    return Number.isInteger(n) && n >= 0 && n < SUB_SCALES.length ? n : SUB_SCALE_DEFAULT;
+  } catch {
+    // 隐私模式下 localStorage 会抛，字号偏好不值得让页面挂掉
+    return SUB_SCALE_DEFAULT;
+  }
+}
 
 interface Row {
   id: string;
@@ -23,13 +50,20 @@ function RowView({ row, index }: { row: Row; index: number }) {
         )}
       </div>
       {row.zh ? (
-        <p className="mt-1 text-[15px] leading-6 text-slate-50">{row.zh}</p>
+        <p className="mt-1 leading-7 text-slate-50" style={{ fontSize: 'var(--sub, 15px)' }}>
+          {row.zh}
+        </p>
       ) : (
-        <p className="mt-1 text-[15px] leading-6 text-slate-500">
+        <p className="mt-1 leading-7 text-slate-500" style={{ fontSize: 'var(--sub, 15px)' }}>
           {row.pending ? '（正在翻译）' : '（未翻译）'}
         </p>
       )}
-      <p className="mt-1 text-xs leading-5 text-slate-500">{row.en}</p>
+      <p
+        className="mt-1 leading-5 text-slate-500"
+        style={{ fontSize: 'calc(var(--sub, 15px) * 0.8)' }}
+      >
+        {row.en}
+      </p>
     </div>
   );
 }
@@ -44,6 +78,20 @@ export function LiveView() {
 
   const parentRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
+  const [subScale, setSubScale] = useState(readSubScale);
+  const download = useSessionStore((s) => s.download);
+
+  const cycleSubScale = useCallback(() => {
+    setSubScale((current) => {
+      const next = (current + 1) % SUB_SCALES.length;
+      try {
+        localStorage.setItem(SUB_SCALE_KEY, String(next));
+      } catch {
+        // 存不下就算了，本次会话内仍然生效
+      }
+      return next;
+    });
+  }, []);
 
   const rows = useMemo<Row[]>(
     () =>
@@ -81,7 +129,10 @@ export function LiveView() {
   };
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    <div
+      className="flex min-h-0 flex-1 flex-col"
+      style={{ '--sub': `${SUB_SCALES[subScale]}px` } as CSSProperties}
+    >
       <div className="flex items-center gap-2 px-3 py-2">
         <span className="relative flex h-2.5 w-2.5">
           <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-danger-400 opacity-70" />
@@ -91,6 +142,30 @@ export function LiveView() {
           {plan?.asr.privacy === 'network' ? '识别中（音频会联网）' : '识别中（本机处理）'}
         </span>
         <span className="ml-auto font-mono text-xs text-slate-500">{rows.length} 句</span>
+        {/* 手机立在桌上、人离它一两米时，15px 的字看不清。三档一键切换，选过就记住。 */}
+        <button
+          type="button"
+          onClick={cycleSubScale}
+          className="shrink-0 rounded-lg border border-ink-700 px-2 py-0.5 text-[11px] text-slate-400 active:bg-ink-800"
+          aria-label={`字幕字号，当前${SUB_SCALE_LABELS[subScale]}，点击切换`}
+          title="切换字幕字号"
+        >
+          字号·{SUB_SCALE_LABELS[subScale]}
+        </button>
+      </div>
+
+      {/* 下载进度放在这里而不是只放在开始页：点了「开始」之后界面就是这一屏，
+          模型还在下的时候必须让用户看得见进度（M2 验收第 3 条）。 */}
+      {download && (
+        <div className="px-3 pb-2">
+          <DownloadBar compact />
+        </div>
+      )}
+
+      {/* 中断提示必须贴在字幕上方：中断发生时页面是沉默的，
+          用户不看到这句话就会以为还在录。 */}
+      <div className="px-3 pb-2 empty:hidden">
+        <InterruptionBanner />
       </div>
 
       <div
@@ -104,7 +179,9 @@ export function LiveView() {
               {status === 'preparing' ? '正在准备模型与麦克风…' : '正在听…'}
             </p>
             <p className="text-xs leading-5 text-slate-500">
-              对着手机或电脑正常说话即可。停顿一下，识别结果就会出现。
+              {download
+                ? '正在把模型下载到本机，只有第一次需要。可以先去倒杯水，别关这个页面。'
+                : '对着手机或电脑正常说话即可。停顿一下，识别结果就会出现。'}
             </p>
           </div>
         ) : (
@@ -134,7 +211,9 @@ export function LiveView() {
         {partial && (
           <div className="sticky bottom-0 border-t border-ink-700/70 bg-ink-850/95 px-3 py-2 backdrop-blur">
             <div className="font-mono text-[11px] text-slate-500">正在识别</div>
-            <p className="text-sm leading-6 text-slate-300">{partial.text}</p>
+            <p className="leading-7 text-slate-300" style={{ fontSize: 'var(--sub, 15px)' }}>
+              {partial.text}
+            </p>
           </div>
         )}
       </div>

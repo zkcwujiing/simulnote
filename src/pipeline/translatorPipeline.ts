@@ -37,10 +37,11 @@ import {
   type ProbeReport,
   type ResolvedPlan,
 } from '@/engines/registry';
-import { startCapture, type CaptureHandle } from '@/lib/audio/capture';
+import { startCapture, type CaptureHandle, type CaptureHealth } from '@/lib/audio/capture';
 import { UtteranceSegmenter } from '@/lib/audio/vad';
 import { toChineseError } from '@/lib/errors';
 import { log } from '@/lib/logger';
+import type { InterruptionLevel } from '@/lib/session/lifecycle';
 
 export type PipelineEvent =
   | { type: 'status'; status: SessionStatus; detail?: string }
@@ -72,8 +73,20 @@ export class TranslatorPipeline {
   private segments: FinalSegment[] = [];
   private translations = new Map<string, string>();
   private translationQueue: Promise<void> = Promise.resolve();
+  /**
+   * 「这句是什么时候到的」——翻译延迟的分母。
+   *
+   * 这个 Map **必须在译完之后删掉**。它原先只 set 不 delete，一场两小时的会
+   * 就是几千条永远不释放的条目；单条很小，但它是「长会话内存只涨不落」的第一块砖。
+   */
   private arrivalTimes = new Map<string, number>();
-  private latencies: number[] = [];
+  /**
+   * 延迟统计只留「和」与「个数」，不再留整个数组。
+   * 我们要的只是平均值（见 `buildStats`），存下每一笔是纯粹的浪费 ——
+   * 而且是个无界数组，会话越长越大。
+   */
+  private latencySum = 0;
+  private latencyCount = 0;
   private degradedCount = 0;
   private audioDurationMs = 0;
   private startedAt = 0;
@@ -155,14 +168,7 @@ export class TranslatorPipeline {
     try {
       if (resolved.asr.audioSource === 'external') {
         this.emit({ type: 'notice', level: 'info', message: '正在开启麦克风…' });
-        const capture = await startCapture(
-          (frame) => {
-            if (this.stopped) return;
-            const utterance = this.segmenter.push(frame);
-            if (utterance) this.feedUtterance(utterance.samples, utterance.startMs, utterance.endMs);
-          },
-          { targetRate: 16000 },
-        );
+        const capture = await startCapture(this.onAudioFrame, { targetRate: 16000 });
         this.capture = capture;
         if (capture.usingFallback) {
           this.emit({
@@ -183,6 +189,17 @@ export class TranslatorPipeline {
       await this.cleanupCapture();
     }
   }
+
+  /**
+   * 采集帧的唯一入口。抽成字段（而不是内联箭头函数）是为了让
+   * **锁屏中断之后重挂麦克风**能复用同一个处理函数 —— 否则重挂时要么复制一份
+   * 逻辑、要么把回调再传一层，两边迟早会走歪。
+   */
+  private readonly onAudioFrame = (frame: Float32Array): void => {
+    if (this.stopped) return;
+    const utterance = this.segmenter.push(frame);
+    if (utterance) this.feedUtterance(utterance.samples, utterance.startMs, utterance.endMs);
+  };
 
   private feedUtterance(samples: Float32Array, startMs: number, endMs: number): void {
     const asr = this.resolved?.asr;
@@ -221,13 +238,15 @@ export class TranslatorPipeline {
         if (!cleaned) throw new Error('引擎返回了空译文');
         this.translations.set(segment.id, cleaned);
         const latencyMs = performance.now() - arrival;
-        this.latencies.push(latencyMs);
+        this.latencySum += latencyMs;
+        this.latencyCount += 1;
         this.emit({ type: 'translation', id: segment.id, text: cleaned, latencyMs });
       } catch (error) {
         this.degradedCount += 1;
         const message = error instanceof EngineError ? error.message : toChineseError(error, '翻译失败');
         this.emit({ type: 'translation-failed', id: segment.id, message });
       }
+      this.arrivalTimes.delete(segment.id);
       this.emitStats();
     });
   }
@@ -239,10 +258,7 @@ export class TranslatorPipeline {
   }
 
   private buildStats(): SessionStats {
-    const meanLatencyMs =
-      this.latencies.length > 0
-        ? this.latencies.reduce((a, b) => a + b, 0) / this.latencies.length
-        : 0;
+    const meanLatencyMs = this.latencyCount > 0 ? this.latencySum / this.latencyCount : 0;
     const transcriptDurationMs = this.segments.reduce(
       (sum, s) => sum + Math.max(0, s.endMs - s.startMs),
       0,
@@ -387,6 +403,161 @@ export class TranslatorPipeline {
 
   getTranslation(id: string): string | undefined {
     return this.translations.get(id);
+  }
+
+  // ==================================================================
+  // M2 · 锁屏 / 切后台的中断与恢复
+  //
+  // 手机浏览器的行为是：锁屏或切走 → 音频图被挂起 → 久一点音轨直接被系统回收。
+  // 这两件事**都不会报错**，`status` 还是 running，用户回来以为还在录。
+  // 所以下面这组方法要回答两个问题：现在采集还活着吗？不活能不能救？
+  // ==================================================================
+
+  /** 不使用麦克风采集的链路（浏览器原生识别）返回 null。 */
+  captureHealth(): CaptureHealth | null {
+    return this.capture?.health() ?? null;
+  }
+
+  /**
+   * 回到前台之后调用。
+   * 分级返回给 UI：`paused` 只是挂起、已经叫醒；`audio-lost` 是音轨没了、重开了麦克风。
+   */
+  async recoverCapture(): Promise<{ level: InterruptionLevel; message: string }> {
+    const capture = this.capture;
+    if (!capture) {
+      return this.stopped
+        ? { level: 'none', message: '会话已结束' }
+        : { level: 'audio-lost', message: '麦克风采集已经不在了，请重新开始录音' };
+    }
+
+    const health = capture.health();
+    if (health.live) return { level: 'none', message: '采集正常' };
+    if (health.state === 'closed') return { level: 'none', message: '采集已停止' };
+
+    if (health.state === 'suspended') {
+      const ok = await capture.resume();
+      if (ok) return { level: 'paused', message: '音频处理已恢复，继续录音' };
+      return this.reattachCapture('音频处理叫不醒');
+    }
+
+    return this.reattachCapture(health.reason);
+  }
+
+  /**
+   * 音轨被回收之后唯一的办法是重新 `getUserMedia`。
+   * **刻意不重建引擎**：模型还在内存里，重建要多等十几秒，而用户只是锁了个屏。
+   */
+  private async reattachCapture(
+    why: string,
+  ): Promise<{ level: InterruptionLevel; message: string }> {
+    const resolved = this.resolved;
+    if (!resolved || this.stopped) {
+      return { level: 'audio-lost', message: `${why}；会话已结束，不再重开麦克风` };
+    }
+    if (resolved.asr.audioSource !== 'external') {
+      // 浏览器原生识别自己占着麦克风，管线无从代劳。
+      return {
+        level: 'audio-lost',
+        message: `${why}；当前识别引擎自己占用麦克风，需要你手动重新开始`,
+      };
+    }
+    await this.cleanupCapture();
+    try {
+      this.capture = await startCapture(this.onAudioFrame, { targetRate: 16000 });
+      this.emit({
+        type: 'notice',
+        level: 'warn',
+        message: `${why}，已重新打开麦克风。刚才那段时间的音频没有录到。`,
+      });
+      return { level: 'audio-lost', message: `${why}，已重新打开麦克风` };
+    } catch (error) {
+      const message = toChineseError(error, '重新打开麦克风失败');
+      this.emit({ type: 'notice', level: 'error', message });
+      return { level: 'audio-lost', message };
+    }
+  }
+
+  /**
+   * M2 · 长时间会话的内存回收：把识别模型卸掉。
+   *
+   * 为什么只卸 ASR 不卸 MT：ASR（Whisper）是两者里大的那个，而且**纪要生成之后
+   * 就不再需要它**；MT 留着，用户翻看纪要时若还有零星补翻不用重新加载。
+   *
+   * 为什么可以放心卸：引擎的 `dispose()` 会把 `transcriber` 置空，下一次
+   * `start()` 调 `init()` 会重新加载 —— 模型文件在 Cache Storage 里，通常是几秒
+   * 而不是几十秒。只有在会话已经停下来之后才允许调用（录音中卸掉会直接断链）。
+   */
+  async releaseAsr(): Promise<boolean> {
+    const asr = this.resolved?.asr;
+    if (!asr) return false;
+    if (!this.stopped) {
+      log.warn('pipeline', '会话仍在进行，拒绝释放识别模型');
+      return false;
+    }
+    if (asr.audioSource !== 'external') {
+      // 浏览器原生识别（Web Speech）不占我们的内存，卸了也没有东西可回收，
+      // 反而会让下次「开始」多绕一圈。
+      return false;
+    }
+    try {
+      await asr.dispose();
+      log.info('pipeline', '已释放识别模型（长时间会话内存回收）');
+      return true;
+    } catch (error) {
+      log.warn('pipeline', '释放识别模型失败', error);
+      return false;
+    }
+  }
+
+  // ==================================================================
+  // M2 · 会话留痕（标签页被杀之后的恢复）
+  // ==================================================================
+
+  /** 供「留痕」取一份当前状态的快照。 */
+  snapshotForDraft(): {
+    segments: FinalSegment[];
+    translations: Record<string, string>;
+    audioDurationMs: number;
+    degradedCount: number;
+  } {
+    return {
+      segments: [...this.segments],
+      translations: Object.fromEntries(this.translations),
+      audioDurationMs: Math.round(this.audioDurationMs),
+      degradedCount: this.degradedCount,
+    };
+  }
+
+  /**
+   * 把留痕读回来。**只恢复文字，不恢复音频** —— 音频从来就没落过盘，
+   * 所以恢复之后能看、能导出、能重新出纪要，但补不上缺掉的那一段。
+   */
+  restoreDraft(input: {
+    segments: FinalSegment[];
+    translations: Record<string, string>;
+    audioDurationMs?: number;
+    degradedCount?: number;
+    startedAt?: number;
+  }): void {
+    this.segments = [...input.segments];
+    this.translations = new Map(Object.entries(input.translations));
+    this.audioDurationMs = input.audioDurationMs ?? 0;
+    this.degradedCount = input.degradedCount ?? 0;
+    this.startedAt = input.startedAt ?? Date.now();
+    this.stopped = true;
+    this.flushing = true;
+    log.info('pipeline', `已恢复留痕：${this.segments.length} 句`);
+  }
+
+  /** 恢复之后重新生成纪要（需要先 `prepare()`，它只探测、不下载模型）。 */
+  async summarizeRestored(): Promise<SummaryResult | null> {
+    if (this.segments.length === 0) return null;
+    this.stopped = true;
+    return this.summarize();
+  }
+
+  getStats(): SessionStats {
+    return this.buildStats();
   }
 
   private ensureResolved(): ResolvedPlan {

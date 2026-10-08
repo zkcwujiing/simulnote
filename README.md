@@ -90,7 +90,7 @@ pnpm verify       # 上面三件事一起跑
 
 ## 6. 当前状态
 
-**阶段：M1 最小闭环已跑通 —— 代码可以构建、可以本地运行、模型能从本站加载，尚未在真机上验证过识别质量。**
+**阶段：M1 最小闭环已跑通、M3 纪要质量已达标 —— 代码可以构建、可以本地运行、模型能从本站加载；M2（手机可用）代码侧已完成并自检通过，等真机验收。**
 
 已完成：
 
@@ -103,7 +103,8 @@ pnpm verify       # 上面三件事一起跑
 | 纪要 | `sum-extractive-textrank`：TextRank + MMR 抽取式摘要，外加 `sentenceWeight()` 给串场/客套降权、给含数字与线索词的句子升权；**关键数字由 `sum/facts.ts` 从英文原文按规则抽取**，不经过翻译模型；**质量基准 `pnpm bench:summary` → [`docs/results/V6.md`](docs/results/V6.md)**（数字保留 100%、幻觉 0、precision@5 **100%**、决策/待办 **4/4**） |
 | 决策 | `src/engines/registry.ts`：三档模式（自动 / 完全本地 / 最快启动），探测顺序即优先级，**任何一环都允许降级，绝不白屏** |
 | 模型 | `src/lib/modelSource.ts` 统一配置模型来源（`allowRemoteModels=false` 是护栏）、`scripts/fetch-models.mjs` 负责构建期下载 |
-| 界面 | 环境探测面板、实时双语滚动（虚拟列表）、纪要视图、Markdown/纯文本导出、分享二维码 |
+| 界面 | 环境探测面板、实时双语滚动（虚拟列表）、**字幕字号三档切换并记住**、纪要视图、Markdown/纯文本导出、分享二维码 |
+| 会话安全 | **锁屏/切后台中断恢复 + 会话留痕**（`src/lib/session/lifecycle.ts` 订阅 `visibilitychange`/`freeze`/`resume`/`pagehide`/`pageshow`，`draft.ts` 12 小时 TTL / 400 句上限 / 残缺整体作废）、**长会话内存守卫**（`src/lib/session/memory.ts`，只分级与提醒、**刻意不自动降档**）、**下载进度条同时出现在开始页与「准备中」** |
 | 护栏 | `scripts/check-zero-cost.mjs`（零成本）、`scripts/check-upload-size.mjs`（部署体积） |
 | 验证 | `probe.html` + `src/probe/`：M0 探针页，**已就绪、待真机运行** |
 
@@ -120,7 +121,7 @@ pnpm verify       # 上面三件事一起跑
    > 报 `Create Pages site failed. Error: Resource not accessible by integration` ——
    > 因为创建 Pages 站点需要管理员权限，CI 的 `GITHUB_TOKEN` 永远没有（`enablement: true` 也救不了）。详见 [`docs/10-上线清单.md`](docs/10-上线清单.md) 第 3 步。
    > Cloudflare Pages 那份 workflow 仍然保留但改成手动触发，理由见 [`docs/08-零成本方案与分享方式.md`](docs/08-零成本方案与分享方式.md)。
-3. **手机端体验打磨**：横竖屏、锁屏中断恢复、长时间会话的内存回收。
+3. **手机端体验打磨 —— 代码侧已完成，等真机验收** ✅（2026/10/8）：锁屏中断恢复（`lib/session/lifecycle.ts` + `draft.ts`，离开页面先落盘再报状态）、会话留痕（重进页面问「要不要恢复上次没做完的」）、长时间会话的内存守卫、字幕字号三档自适应、下载进度条在「准备中」也不再消失。**M2 的验收条件本身就是「iPhone Safari + Android Chrome 各完成一次完整会话」，这一条只能在真机上做。** 两项**有意没做**：① `sherpa-onnx` 流式 ASR —— V1 从未真机跑过，而现有 whisper 已在真 iPhone 上 RTF 0.25，换它是买更低延迟、不是买可用性；② Playwright 移动端 E2E —— 本仓库没有任何浏览器自动化依赖，而它恰好模拟不出真机的内存压力、锁屏与 Safari 音频中断。理由见 [`docs/06`](docs/06-开发路线图与里程碑.md) §6.4。
 
 ### 几个必须知道的事实
 
@@ -144,3 +145,5 @@ pnpm verify       # 上面三件事一起跑
 9. **换成 ModelScope 之后 V4 仍然出不了报告，因为分块下载在等一个永远不会来的响应头。** 用户再问「为什么v2通过很慢，v9通过很快但是v4已经运行很久了，还是没有报告」。实测 ModelScope 的响应里**没有 `Access-Control-Expose-Headers`** —— 于是 `Content-Range` 在 `curl` 里看得见、**在浏览器里恒为 `null`**，而 `rangeDownload()` 的循环条件是 `while (total === null || offset < total)`：总长度读不到，循环就没有终点，一路把 `Range` 要过文件末尾撞上 `416`，然后被当成「这个源坏了」→ **换源从第 0 字节整份重下**。V2 只有 42.4 MB，重下一次还能熬过去（「能过但很慢」）；V4 有 117.2 MB，换源再换源，永远轮不到报告。**教训：`curl` 与 Node 都不受 CORS 约束，离线验证通过 ≠ 浏览器里能跑。** 现在总长度改由**构建时注入的模型清单**提供（`vite.config.ts` 扫 `public/models/` 生成 `__MODEL_SIZES__`），`rangeDownload()` 重写成 **4 条 lane 并发 + 原子认领 + 换源续传**（已下好的块留着，下一个源只补缺口）。并发这一项单独就有 **2~4 倍**：同一个文件的 8 MB，串行 7.37 MB/s、并发 4 路 16.13 MB/s、并发 8 路 27.92 MB/s —— **CDN 是按连接限速的**。离线端到端复刻取完 V4 的 117.2 MB 只要 **6.2 秒（18.81 MB/s）**。详见 R21。
 
 10. **「要点覆盖率 ≥ 70%」这条验收标准按字面永远达不到，而且 TextRank 的中心度 ≠ 信息量；更要紧的是，第一版语料本身在骗人。** 建了基准（`pnpm bench:summary` → [`docs/results/V6.md`](docs/results/V6.md)）才发现覆盖率的问题：语料有 23 条要点句，而一页纸纪要只输出 `K = 5` 条，覆盖率的**数学上限**就是 5/23 = 21.7% —— 引擎再准也过不了 70%。这是指标写错了，不是引擎不行。同一个基准还暴露了一个真缺陷：`Let me walk through where we are on the quarter…`（主持人串场）和 `Also please read the incident review before the meeting…`（客套）**霸占了要点榜的第一名和第五名**，因为它们满是 meeting / review / quarter 这类高频词，句图连接数最高 —— 但它们一个字都不该进纪要。`sentenceWeight()` 给串场/客套降权、给含数字与线索词的句子升权之后，这两条被挤了出去。**但真正的大头是语料：第一版把行分成「人工标注」和「讲话原文」两类，而标注是改写、还含原文根本没有的数字** —— `@ The board rejected the Northwind acquisition…` 对应的原句只说了「62 要 95，董事会觉得站不住」；`churn` 的 `2.1 / 3.4` 原文里压根没出现。这等于用一个引擎够不着的标准去扣它的分。2026/10/7 把语料重做成「一句话一行、逐句标是不是要点」，并把原先只存在于标注里的三条事实补回原文，**复测：precision@5 100%（5/5）、决策/待办 4/4、数字保留 100%（11/11）、幻觉 0**。硬不变量「数字表里每条事实必须能在英文原文里逐字找到」已进 `--check`。**注意新旧数字不可直接比**（60% → 100% 里既有算法也有语料的功劳，基准本身分不开）；语料仍只有 1 份 5.4 KB 的合成会议，够回答「有没有在乱挑」，不够证明「摘要好」。详见 R22。
+
+11. **手机上最危险的不是崩溃，是「看起来还在跑」。** M2 自检时发现两类**沉默失败**，共同点是界面一切正常、实际已经坏掉，而且都只在手机上出现。① **锁屏 / 切到别的 App 时系统会把 `AudioContext` 挂起或让音轨结束，而页面收不到任何回调** —— `LiveView` 里那颗红点照常在闪、照常写「识别中」，用户会以为还在录，讲完整场才发现后半段全没了。② **下载进度条原先只挂在开始页，点「开始」后界面切到 `LiveView`，进度条随之消失**，手机首访要下 ~150 MB，用户盯着那句不动的「正在准备模型与麦克风…」等几分钟，和卡死无法区分。对策：`src/lib/session/lifecycle.ts` 同时订阅 `visibilitychange`/`freeze`/`resume`/`pagehide`/`pageshow`（iOS Safari 走 bfcache 那条路，`pagehide` 不一定触发，所以两套都接），按离开时长与音轨状态分成 `audio-lost`/`needs-resume`/`paused`/`none` 四级；`src/lib/session/draft.ts` 在离开时**先把留痕写进盘再报状态**（标签页可能永远不再醒），12 小时 TTL、400 句上限、**任何一处残缺就整体作废 —— 半截恢复出来的纪要比没有更糟**；`DownloadBar` 抽成独立组件同时挂在两处。**已知代价**：真机行为无证据（`pagehide`/`freeze` 各厂商触发时机不一致，这正是 M2 真机验收要盯的第一件事）；恢复出来的是「留痕」不是「续录」，时间轴断了一截，UI 上不假装连续；**不自动重开麦克风**，因为浏览器要求音频必须由用户手势启动（硬限制，不是没做）。详见 R23。

@@ -2,9 +2,10 @@ import { useEffect, useState } from 'react';
 import { LiveView } from '@/components/LiveView';
 import { NoticeBar } from '@/components/NoticeBar';
 import { PlanPanel } from '@/components/PlanPanel';
+import { DraftBanner } from '@/components/SessionRecovery';
 import { ShareCard } from '@/components/ShareCard';
 import { SummaryView } from '@/components/SummaryView';
-import { useSessionStore } from '@/store/sessionStore';
+import { checkDraftOnBoot, useSessionStore } from '@/store/sessionStore';
 
 function SummaryProgress({ text }: { text: string }) {
   return (
@@ -31,6 +32,9 @@ export default function App() {
   // 探测只读能力、不申请麦克风权限、不下载模型，所以可以放心自动执行。
   useEffect(() => {
     void prepare();
+    // 顺手看一眼上次有没有没做完的会话（M2）。和探测分开：探测失败
+    // 也不该影响「把上次的文字找回来」这件事。
+    checkDraftOnBoot();
   }, [prepare]);
 
   const isLive = !summary && (status === 'running' || status === 'preparing');
@@ -85,11 +89,16 @@ export default function App() {
           <SummaryProgress text={summaryProgress} />
         ) : (
           <div className="scroll-area min-h-0 flex-1 overflow-y-auto pb-6">
+            {/* 上次没做完的会话（M2）。放在最上面：它决定了这次要不要从头开始。 */}
+            <div className="pb-3 empty:hidden">
+              <DraftBanner />
+            </div>
             {summary ? (
               <SummaryView />
             ) : (
               <PlanPanel>{showShare && <ShareCard />}</PlanPanel>
             )}
+
           </div>
         )}
       </main>

@@ -34,11 +34,79 @@ export interface CaptureHandle {
   setMuted(muted: boolean): void;
   /** 是否正在使用降级的 ScriptProcessor 路径 */
   readonly usingFallback: boolean;
+  /** 采集还活着吗 —— 锁屏回来之后判断「麦克风是不是已经死了」靠它 */
+  health(): CaptureHealth;
+  /** 尝试把挂起的音频图叫醒。返回恢复之后是否健康。 */
+  resume(): Promise<boolean>;
+}
+
+export type CaptureState = 'live' | 'suspended' | 'ended' | 'closed';
+
+export interface CaptureHealth {
+  state: CaptureState;
+  /** AudioContext.state 原值（Safari 会给出 'interrupted'） */
+  contextState: string;
+  /** 第一条音轨的 readyState */
+  trackState: string;
+  /** 现在能不能继续收到音频帧 */
+  live: boolean;
+  /** 给用户看的中文说明 */
+  reason: string;
+}
+
+/**
+ * 判断采集的健康状况。
+ *
+ * 分成四档而不是一个布尔值，是因为**处置方式完全不同**：
+ *   live       正常
+ *   suspended  音频图被浏览器挂起了（切后台最常见）→ `resume()` 就能救回来
+ *   ended      音轨被系统回收了（锁屏久了、别的 App 抢了麦克风）→ 只能重新 getUserMedia
+ *   closed     已经主动 stop 过
+ * 把它压成一个 `alive: boolean` 的话，调用方分不清该 resume 还是该重开，
+ * 最后就只能一律重开 —— 那会白白再弹一次权限、还会丢掉已经录进来的一段。
+ */
+export function captureHealthOf(
+  contextState: string,
+  trackState: string,
+  stopped: boolean,
+): CaptureHealth {
+  if (stopped || contextState === 'closed') {
+    return {
+      state: 'closed',
+      contextState,
+      trackState,
+      live: false,
+      reason: '采集已停止',
+    };
+  }
+  if (trackState === 'ended') {
+    return {
+      state: 'ended',
+      contextState,
+      trackState,
+      live: false,
+      reason: '麦克风音轨已被系统回收（锁屏久了、或被别的应用占用）',
+    };
+  }
+  if (contextState === 'running') {
+    return { state: 'live', contextState, trackState, live: true, reason: '正在采集' };
+  }
+  return {
+    state: 'suspended',
+    contextState,
+    trackState,
+    live: false,
+    reason: '音频处理被浏览器挂起了（切到后台或锁屏时常见），可尝试恢复',
+  };
 }
 
 export type FrameHandler = (frame: Float32Array) => void;
 
-const WORKLET_URL = `${import.meta.env.BASE_URL}pcm-worklet.js`;
+// `import.meta.env` 只有经 Vite 处理时才存在。这个模块会被单测（Node 直接跑 TS）
+// 引入以验证 `captureHealthOf` 的分级逻辑，所以必须兜底，否则一 import 就抛。
+const viteEnv = (import.meta as { env?: { BASE_URL?: string } }).env;
+const WORKLET_URL = `${viteEnv?.BASE_URL ?? '/'}pcm-worklet.js`;
+
 
 /**
  * 打开麦克风并开始投递音频帧。
@@ -172,6 +240,8 @@ export async function startCapture(
   return makeHandle(targetRate, true);
 
   function makeHandle(rate: number, usingFallback: boolean): CaptureHandle {
+    const firstTrack = (): MediaStreamTrack | undefined => stream.getAudioTracks()[0];
+
     return {
       targetRate: rate,
       usingFallback,
@@ -179,6 +249,26 @@ export async function startCapture(
         muted = next;
         if (usingFallback) return;
         // mute 只影响是否投递；真正停麦在 stop() 里做。
+      },
+      health(): CaptureHealth {
+        return captureHealthOf(context.state, firstTrack()?.readyState ?? 'unknown', stopped);
+      },
+      async resume(): Promise<boolean> {
+        const before = this.health();
+        if (before.state === 'live') return true;
+        // ended / closed 是救不回来的：音轨已经没了，只能重新申请麦克风。
+        if (before.state === 'ended' || before.state === 'closed') return false;
+        try {
+          await context.resume();
+        } catch (error) {
+          log.warn('audio', 'AudioContext.resume 失败', error);
+          return false;
+        }
+        // Safari 从 'interrupted' 回来之后音频图要几帧才开始出数据，
+        // 所以这里不等它立刻变 running，只报告当下看到的。
+        const after = this.health();
+        log.info('audio', `采集恢复尝试：${before.state} → ${after.state}`);
+        return after.live;
       },
       async stop() {
         if (stopped) return;

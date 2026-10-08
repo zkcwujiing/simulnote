@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react';
 import type { StagePlan } from '@/types';
 import { PIPELINE_MODES, type PipelineMode } from '@/engines/registry';
+import { DownloadBar } from '@/components/DownloadBar';
 import { useSessionStore } from '@/store/sessionStore';
 
 function PrivacyChip({ plan }: { plan: StagePlan }) {
@@ -74,31 +75,6 @@ function ModeSelector() {
           </button>
         );
       })}
-    </div>
-  );
-}
-
-function DownloadBar() {
-  const download = useSessionStore((s) => s.download);
-  if (!download) return null;
-  const percent = download.progress === null ? null : Math.round(download.progress * 100);
-  return (
-    <div className="card">
-      <div className="flex items-center justify-between text-sm">
-        <span className="text-slate-200">{download.label}</span>
-        <span className="font-mono text-xs text-slate-400">
-          {percent === null ? '…' : `${percent}%`}
-        </span>
-      </div>
-      <div className="mt-2 h-2 overflow-hidden rounded-full bg-ink-800">
-        <div
-          className="h-full rounded-full bg-brand-500 transition-[width] duration-300"
-          style={{ width: `${percent ?? 8}%` }}
-        />
-      </div>
-      <p className="mt-2 text-xs text-slate-400">
-        首次使用需要把模型下载到本机，之后就不再下载了。下载完可以断网使用。
-      </p>
     </div>
   );
 }
